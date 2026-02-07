@@ -6,7 +6,7 @@ This repository provides the official implementation for VCWorld, including:
 - the CLI pipeline for DE/DIR prediction,
 - prompt construction templates and single-case analysis utilities,
 - inference runners for local HF models or API-backed LLMs.
-![VCWorld pipeline](https://github.com/mrzzmrzz/VCWorld/blob/main/VCWorld%20pipeline.pdf)
+![VCWorld pipeline](assets/VCWorld%20pipeline.png)
 ## Overview
 VCWorld introduces a biological world model that explicitly reasons through mechanisms rather than relying on black-box prediction. It is designed for data-efficient, interpretable prediction of perturbation effects.
 
