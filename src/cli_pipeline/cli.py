@@ -60,6 +60,10 @@ def _add_infer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--device-map", default="auto")
     p.add_argument("--chat-template", default=None, help="Optional chat template file to override tokenizer.chat_template")
+    p.add_argument("--max-input-tokens", type=int, default=None,
+                   help="Optional max input token length. Long prompts will be truncated.")
+    p.add_argument("--disable-length-sort", action="store_true",
+                   help="Disable sorting prompts by input length before batching.")
 
 
 def _add_infer_api_args(p: argparse.ArgumentParser) -> None:
@@ -183,6 +187,8 @@ def main(argv: list[str]) -> int:
             dtype=args.dtype,
             device_map=args.device_map,
             chat_template_path=args.chat_template,
+            max_input_tokens=args.max_input_tokens,
+            sort_by_input_length=not args.disable_length_sort,
         )
         return 0
 
