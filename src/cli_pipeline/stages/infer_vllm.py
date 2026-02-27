@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from transformers import AutoTokenizer
 
@@ -34,16 +34,16 @@ def _generate_with_vllm(
     *,
     llm,
     sampling_params,
-    prompt_texts: Sequence[str],
+    prompt_inputs: Sequence[Any],
     batch_size: int,
 ) -> List[str]:
-    if not prompt_texts:
+    if not prompt_inputs:
         return []
 
-    total_batches = math.ceil(len(prompt_texts) / batch_size)
+    total_batches = math.ceil(len(prompt_inputs) / batch_size)
     generated: List[str] = []
-    for i in range(0, len(prompt_texts), batch_size):
-        batch = list(prompt_texts[i:i + batch_size])
+    for i in range(0, len(prompt_inputs), batch_size):
+        batch = list(prompt_inputs[i:i + batch_size])
         outputs = llm.generate(batch, sampling_params=sampling_params, use_tqdm=False)
         # vLLM returns outputs aligned to input order.
         for out in outputs:
@@ -119,12 +119,26 @@ def run_inference_vllm(
     if sort_by_input_length:
         indexed_prompts.sort(key=lambda x: len(x[1]))
 
-    if max_input_tokens is not None:
-        truncated_indexed = []
-        for idx, prompt in indexed_prompts:
-            toks = tokenizer(prompt, truncation=True, max_length=max_input_tokens)["input_ids"]
-            truncated_indexed.append((idx, tokenizer.decode(toks, skip_special_tokens=False)))
-        indexed_prompts = truncated_indexed
+    # Keep a safety margin so generation always has room in the context window.
+    # If max_model_len is set, we cap input length to <= max_model_len - max_new_tokens - 1.
+    safe_max_input_tokens = max_input_tokens
+    if max_model_len is not None:
+        safe_cap = max(1, int(max_model_len) - int(max_new_tokens) - 1)
+        if safe_max_input_tokens is None:
+            safe_max_input_tokens = safe_cap
+        else:
+            safe_max_input_tokens = min(int(safe_max_input_tokens), safe_cap)
+
+    # Tokenize once and pass token IDs directly to vLLM to avoid re-tokenization drift.
+    indexed_prompt_inputs = []
+    for idx, prompt in indexed_prompts:
+        tok = tokenizer(
+            prompt,
+            truncation=safe_max_input_tokens is not None,
+            max_length=safe_max_input_tokens,
+            add_special_tokens=False,
+        )["input_ids"]
+        indexed_prompt_inputs.append((idx, {"prompt_token_ids": tok}))
 
     llm_kwargs = {
         "model": model_name,
@@ -143,16 +157,16 @@ def run_inference_vllm(
         max_tokens=max_new_tokens,
     )
 
-    sorted_prompts = [txt for _, txt in indexed_prompts]
+    sorted_prompt_inputs = [inp for _, inp in indexed_prompt_inputs]
     sorted_outputs = _generate_with_vllm(
         llm=llm,
         sampling_params=sampling_params,
-        prompt_texts=sorted_prompts,
+        prompt_inputs=sorted_prompt_inputs,
         batch_size=batch_size,
     )
 
     generated_by_index: List[Optional[str]] = [None] * len(all_messages)
-    for (idx, _), text in zip(indexed_prompts, sorted_outputs):
+    for (idx, _), text in zip(indexed_prompt_inputs, sorted_outputs):
         generated_by_index[idx] = text
 
     all_results = []
@@ -189,4 +203,3 @@ def run_inference_vllm(
         f.writelines(all_results)
 
     print(f"Saved outputs: {output_file}")
-
