@@ -32,13 +32,14 @@ SHARD_ROOT="/projects/AI4D/core-132/PerturbReason_data/C32_DE_shards_32"
 PROMPTS_SHARD="${SHARD_ROOT}/prompts_$(printf "%03d" "${SLURM_ARRAY_TASK_ID}").txt"
 OUT_SHARD="${SHARD_ROOT}/vllm_predictions_$(printf "%03d" "${SLURM_ARRAY_TASK_ID}").txt"
 
-PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-VLLM_DISABLE_CUSTOM_ALL_REDUCE=1 \
+PYTHONUNBUFFERED=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+VLLM_DISABLE_CUSTOM_ALL_REDUCE=1 NCCL_CUMEM_ENABLE=0 \
 python -u cli.py de infer-vllm \
   --model "${MODEL_PATH}" \
   --prompts "${PROMPTS_SHARD}" \
   --out "${OUT_SHARD}" \
-  --batch-size 64 \
+  --batch-size 16 \
   --max-new-tokens 1024 \
   --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.92
+  --gpu-memory-utilization 0.80 \
+  --max-model-len 4096
