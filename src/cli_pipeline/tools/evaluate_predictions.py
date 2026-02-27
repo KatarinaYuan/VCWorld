@@ -248,8 +248,6 @@ def evaluate(
     prompts = _parse_prompts(prompts_file)
     pred_by_id = _parse_predictions(task, predictions_file)
     truth_map = _load_truth_map(truth_csv, split=split)
-    
-    ipdb.set_trace()
 
     rows = []
     missing_pred = 0

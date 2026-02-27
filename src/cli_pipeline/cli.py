@@ -9,6 +9,7 @@ from stages.prepare import process_cell_line
 from stages.retrieve import build_retrieval_results
 from stages.prompt import generate_prompts
 from stages.infer import run_inference
+from stages.infer_vllm import run_inference_vllm
 from stages.infer_api import run_inference_api
 from stages.single_case.prompt import generate_single_case_prompt
 
@@ -79,6 +80,26 @@ def _add_infer_api_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sleep-secs", type=float, default=0.0)
 
 
+def _add_infer_vllm_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--model", required=True, help="HF model path or name")
+    p.add_argument("--prompts", required=True, help="Prompt text file")
+    p.add_argument("--out", required=True, help="Output text file")
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=512)
+    p.add_argument("--temperature", type=float, default=0.6)
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--chat-template", default=None, help="Optional chat template file to override tokenizer.chat_template")
+    p.add_argument("--max-input-tokens", type=int, default=None,
+                   help="Optional max input token length. Long prompts will be truncated.")
+    p.add_argument("--disable-length-sort", action="store_true",
+                   help="Disable sorting prompts by input length before batching.")
+    p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--pipeline-parallel-size", type=int, default=1)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--max-model-len", type=int, default=None)
+    p.add_argument("--trust-remote-code", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LLM Drug pipeline (DE/DIR) CLI")
     task_sub = parser.add_subparsers(dest="task", required=True)
@@ -101,6 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
 
         infer_api_p = stage_sub.add_parser("infer-api")
         _add_infer_api_args(infer_api_p)
+
+        infer_vllm_p = stage_sub.add_parser("infer-vllm")
+        _add_infer_vllm_args(infer_vllm_p)
 
     single_p = task_sub.add_parser("single")
     single_stage = single_p.add_subparsers(dest="stage", required=True)
@@ -204,6 +228,26 @@ def main(argv: list[str]) -> int:
             top_p=args.top_p,
             timeout=args.timeout,
             sleep_secs=args.sleep_secs,
+        )
+        return 0
+
+    if args.task in ("de", "dir") and args.stage == "infer-vllm":
+        run_inference_vllm(
+            model_name=args.model,
+            prompts_file=args.prompts,
+            output_file=args.out,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            chat_template_path=args.chat_template,
+            max_input_tokens=args.max_input_tokens,
+            sort_by_input_length=not args.disable_length_sort,
+            tensor_parallel_size=args.tensor_parallel_size,
+            pipeline_parallel_size=args.pipeline_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            trust_remote_code=args.trust_remote_code,
         )
         return 0
 
