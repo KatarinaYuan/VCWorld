@@ -61,4 +61,5 @@ python -u cli.py de infer-vllm \
   --max-new-tokens 1024 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.75 \
-  --max-model-len 4096
+  --max-model-len 4096 \
+  --long-context-first
