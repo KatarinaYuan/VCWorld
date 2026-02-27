@@ -66,6 +66,7 @@ def run_inference_vllm(
     top_p: float = 0.9,
     chat_template_path: Optional[str] = None,
     sort_by_input_length: bool = True,
+    long_context_first: bool = False,
     max_input_tokens: Optional[int] = None,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
@@ -117,7 +118,7 @@ def run_inference_vllm(
 
     indexed_prompts = list(enumerate(rendered_prompts))
     if sort_by_input_length:
-        indexed_prompts.sort(key=lambda x: len(x[1]))
+        indexed_prompts.sort(key=lambda x: len(x[1]), reverse=long_context_first)
 
     # Keep a safety margin so generation always has room in the context window.
     # If max_model_len is set, we cap input length to <= max_model_len - max_new_tokens - 1.

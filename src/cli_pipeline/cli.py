@@ -93,6 +93,8 @@ def _add_infer_vllm_args(p: argparse.ArgumentParser) -> None:
                    help="Optional max input token length. Long prompts will be truncated.")
     p.add_argument("--disable-length-sort", action="store_true",
                    help="Disable sorting prompts by input length before batching.")
+    p.add_argument("--long-context-first", action="store_true",
+                   help="When length sorting is enabled, process longest prompts first.")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--pipeline-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -243,6 +245,7 @@ def main(argv: list[str]) -> int:
             chat_template_path=args.chat_template,
             max_input_tokens=args.max_input_tokens,
             sort_by_input_length=not args.disable_length_sort,
+            long_context_first=args.long_context_first,
             tensor_parallel_size=args.tensor_parallel_size,
             pipeline_parallel_size=args.pipeline_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
