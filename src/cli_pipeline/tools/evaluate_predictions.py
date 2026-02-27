@@ -11,8 +11,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import ipdb
-
 PROMPT_SEPARATOR = "================================================================================"
 PROMPT_HEADER_RE = re.compile(r"===\s*Prompt\s*(\d+)\s*\((.*?)\)\s*===", re.DOTALL)
 QUERY_HEADER_RE = re.compile(r"---\s*Query for Prompt\s*(\d+)\s*---")
@@ -59,23 +57,49 @@ def _extract_pred_label(task: str, query_text: str) -> str:
       dir: increase / decrease / insufficient
     Incomplete outputs are treated as insufficient by design.
     """
-    tail = "\n".join(query_text.strip().splitlines()[-30:]).lower()
+    text = query_text.strip()
+    lower = text.lower()
+    final_anchor = lower.rfind("final deterministic prediction")
+    if final_anchor >= 0:
+        focus = text[final_anchor:].lower()
+    else:
+        focus = "\n".join(text.splitlines()[-50:]).lower()
 
     if task == "de":
-        if re.search(r"^\s*yes\.", tail, re.MULTILINE):
-            return "yes"
-        if re.search(r"^\s*no\.", tail, re.MULTILINE):
+        # Explicit "no" patterns first to avoid false positive from generic "impact".
+        if (
+            re.search(r"^\s*[\*\-\s]*no[\.\:\s]", focus, re.MULTILINE)
+            or re.search(r"\bdoes\s+not\s+(impact|affect|result\s+in\s+differential\s+expression)\b", focus)
+            or re.search(r"\b(no|without)\s+(impact|effect)\b", focus)
+        ):
             return "no"
-        if "insufficient evidence" in tail:
+        if (
+            re.search(r"^\s*[\*\-\s]*yes[\.\:\s]", focus, re.MULTILINE)
+            or re.search(r"\bresults?\s+in\s+differential\s+expression\b", focus)
+            or re.search(r"\b(predict|prediction).*?\b(differential\s+expression|impact|affect)\b", focus)
+            or re.search(r"\bperturbation\b.*\b(impacts?|affects?)\b", focus)
+        ):
+            return "yes"
+        if "insufficient evidence" in focus:
             return "insufficient"
         return "insufficient"
 
     # dir
-    if re.search(r"^\s*increase\.", tail, re.MULTILINE):
-        return "increase"
-    if re.search(r"^\s*decrease\.", tail, re.MULTILINE):
+    if (
+        re.search(r"^\s*[\*\-\s]*decrease[\.\:\s]", focus, re.MULTILINE)
+        or re.search(r"\bresults?\s+in\s+(a\s+)?decrease\b", focus)
+        or re.search(r"\bpredict.*\bdecrease\b", focus)
+        or re.search(r"\bdecreases?\s+expression\b", focus)
+    ):
         return "decrease"
-    if "insufficient evidence" in tail:
+    if (
+        re.search(r"^\s*[\*\-\s]*increase[\.\:\s]", focus, re.MULTILINE)
+        or re.search(r"\bresults?\s+in\s+(an?\s+)?increase\b", focus)
+        or re.search(r"\bpredict.*\bincrease\b", focus)
+        or re.search(r"\bincreases?\s+expression\b", focus)
+    ):
+        return "increase"
+    if "insufficient evidence" in focus:
         return "insufficient"
     return "insufficient"
 
