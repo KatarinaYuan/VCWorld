@@ -101,7 +101,7 @@ def run_inference(*, model_name: str, prompts_file: str, output_file: str, batch
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=_dtype_from_name(dtype),
+        torch_dtype=_dtype_from_name(dtype),
         device_map=device_map,
     )
 

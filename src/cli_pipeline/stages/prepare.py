@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import scanpy as sc
+from tqdm import tqdm
 
 
 def process_cell_line(
@@ -59,8 +60,10 @@ def process_cell_line(
         corr_method="benjamini-hochberg",
     )
 
+    print("Extracting DE results...")
+
     results_list = []
-    for drug in drug_perturbations:
+    for drug in tqdm(drug_perturbations):
         try:
             result_df = pd.DataFrame({
                 "gene": adata.uns["rank_genes_groups"]["names"][drug],
