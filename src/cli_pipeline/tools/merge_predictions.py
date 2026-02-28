@@ -29,11 +29,12 @@ def merge_outputs(
     for shard in shards:
         sid = int(shard["shard_id"])
         expected = int(shard["num_blocks"])
-        if pred_dir is None:
-            pred_file = Path(shard["predictions_file"])
+        default_pred_file = Path(shard["predictions_file"])
+        if pred_prefix is None:
+            pred_file = default_pred_file if pred_dir is None else (pred_dir / default_pred_file.name)
         else:
-            prefix = "predictions" if pred_prefix is None else pred_prefix
-            pred_file = pred_dir / f"{prefix}_{sid:03d}.txt"
+            base_dir = default_pred_file.parent if pred_dir is None else pred_dir
+            pred_file = base_dir / f"{pred_prefix}_{sid:03d}.txt"
 
         if not pred_file.exists():
             raise FileNotFoundError(f"Missing shard output: {pred_file}")
@@ -85,4 +86,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
