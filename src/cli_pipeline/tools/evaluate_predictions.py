@@ -316,13 +316,19 @@ def evaluate(
 
     q_score = (unanswered / total_eval) if total_eval > 0 else None
     answered_rate = (answered / total_eval) if total_eval > 0 else None
-
+    
     metrics = {}
     if answered > 0:
         y_true = [int(r["true_label"]) for r in answered_rows]
         y_pred = [int(r["pred_binary"]) for r in answered_rows]
         y_score = y_pred  # hard-label score for AUROC/AUPRC
         metrics = _binary_metrics(y_true, y_pred, y_score)
+        import numpy as np
+        with open("wrong_prediction.tmp", "w") as fout:
+            idx = (np.array(y_pred)!=np.array(y_true)).nonzero()
+            for x in idx[0]:
+                fout.write(pred_by_id[int(x) + 1]["query_block"] + "\n\n")
+
     else:
         metrics = {
             "accuracy": None,
