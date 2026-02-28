@@ -162,13 +162,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--lora-target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+    p.add_argument("--line-profile", action="store_true", help="Enable line_profiler for run().")
+    p.add_argument("--line-profile-out", default=None, help="Optional output file for line_profiler stats.")
     return p
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    run(args)
+    if not args.line_profile:
+        run(args)
+        return 0
+
+    try:
+        from line_profiler import LineProfiler
+    except ImportError as e:
+        raise RuntimeError(
+            "line_profiler is not installed. Install with `pip install line_profiler` "
+            "or run without --line-profile."
+        ) from e
+
+    print("[TTT-lite] line_profiler enabled")
+    lp = LineProfiler()
+    profiled_run = lp(run)
+    profiled_run(args)
+    lp.print_stats()
+    if args.line_profile_out:
+        with open(args.line_profile_out, "w", encoding="utf-8") as f:
+            lp.print_stats(stream=f)
+        print(f"[TTT-lite] Saved line_profiler stats to: {args.line_profile_out}")
     return 0
 
 
