@@ -13,6 +13,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ttt_common import format_prediction_block, load_label_map, load_prompts, render_chat_prompt
 
+# kernprof injects `profile` into builtins; provide a no-op fallback for normal runs.
+try:
+    profile  # type: ignore[name-defined]
+except NameError:
+    def profile(func):  # type: ignore[no-redef]
+        return func
+
 
 def _trainable_named_params(model) -> List[Tuple[str, torch.nn.Parameter]]:
     return [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -60,6 +67,7 @@ def _build_model_and_tokenizer(args):
     return model, tokenizer
 
 
+@profile
 def run(args) -> None:
     print("[TTT-lite] ===== Run Config =====")
     print(
