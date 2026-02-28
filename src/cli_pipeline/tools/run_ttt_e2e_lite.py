@@ -29,10 +29,12 @@ def _restore_params(named_params: List[Tuple[str, torch.nn.Parameter]], snap: Di
 
 
 def _build_model_and_tokenizer(args):
+    print(f"[TTT-E2E-lite] Loading tokenizer from: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print(f"[TTT-E2E-lite] Loading base model from: {args.model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
@@ -41,8 +43,10 @@ def _build_model_and_tokenizer(args):
     )
 
     if args.init_adapter:
+        print(f"[TTT-E2E-lite] Loading initial adapter: {args.init_adapter}")
         model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
     else:
+        print("[TTT-E2E-lite] Initializing fresh LoRA adapter")
         lora_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -76,20 +80,34 @@ def _build_train_sequences(args, tokenizer) -> List[List[int]]:
 
 
 def run(args) -> None:
+    print("[TTT-E2E-lite] ===== Run Config =====")
+    print(
+        f"[TTT-E2E-lite] model={args.model_name} | prompts={args.prompts_file} | labels={args.labels_csv} | out_dir={args.output_dir}"
+    )
+    print(
+        f"[TTT-E2E-lite] epochs={args.num_epochs} inner_steps={args.inner_steps} inner_lr={args.inner_lr} "
+        f"outer_lr={args.outer_lr} chunk_tokens={args.chunk_tokens} max_seq_len={args.max_seq_len}"
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     model, tokenizer = _build_model_and_tokenizer(args)
     model.train()
+    print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
+    print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")
 
     named_params = _trainable_named_params(model)
+    print(f"[TTT-E2E-lite] Trainable params: {len(named_params)} tensors")
     inner_opt = torch.optim.SGD([p for _, p in named_params], lr=args.inner_lr)
     outer_opt = torch.optim.AdamW([p for _, p in named_params], lr=args.outer_lr)
     device = next(model.parameters()).device
+    print(f"[TTT-E2E-lite] Running on device: {device}")
 
     for epoch in range(1, args.num_epochs + 1):
+        print(f"[TTT-E2E-lite] ---- Epoch {epoch}/{args.num_epochs} start ----")
         total_outer = 0.0
+        n_effective = 0
         for i, ids in enumerate(seqs, 1):
             # Chunked scan over a single sequence (no support/query split).
             chunk_tokens = max(2, args.chunk_tokens)
@@ -147,18 +165,27 @@ def run(args) -> None:
             outer_opt.step()
 
             total_outer += float(outer_loss.detach().cpu())
+            n_effective += 1
             if i % args.log_every == 0:
                 avg_outer = total_outer / max(1, i)
-                print(f"epoch={epoch} step={i}/{len(seqs)} avg_outer_loss={avg_outer:.4f}")
+                print(
+                    f"[TTT-E2E-lite] epoch={epoch} step={i}/{len(seqs)} chunks={len(chunks)} "
+                    f"outer_loss={float(outer_loss.detach().cpu()):.4f} avg_outer_loss={avg_outer:.4f}"
+                )
 
         ckpt_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
         model.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
-        print(f"Saved epoch checkpoint: {ckpt_dir}")
+        avg_epoch_outer = total_outer / max(1, n_effective)
+        print(
+            f"[TTT-E2E-lite] Epoch {epoch} done | effective_steps={n_effective} "
+            f"| avg_outer_loss={avg_epoch_outer:.4f}"
+        )
+        print(f"[TTT-E2E-lite] Saved epoch checkpoint: {ckpt_dir}")
 
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved final TTT-E2E-lite adapter: {args.output_dir}")
+    print(f"[TTT-E2E-lite] Saved final adapter: {args.output_dir}")
 
 
 def build_parser() -> argparse.ArgumentParser:

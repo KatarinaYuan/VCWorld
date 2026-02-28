@@ -28,10 +28,12 @@ def _restore_params(named_params: List[Tuple[str, torch.nn.Parameter]], snap: Di
 
 
 def _build_model_and_tokenizer(args):
+    print(f"[TTT-lite] Loading tokenizer from: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print(f"[TTT-lite] Loading base model from: {args.model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
@@ -40,8 +42,10 @@ def _build_model_and_tokenizer(args):
     )
 
     if args.init_adapter:
+        print(f"[TTT-lite] Loading initial adapter: {args.init_adapter}")
         model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
     else:
+        print("[TTT-lite] Initializing fresh LoRA adapter")
         lora_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -57,9 +61,19 @@ def _build_model_and_tokenizer(args):
 
 
 def run(args) -> None:
+    print("[TTT-lite] ===== Run Config =====")
+    print(
+        f"[TTT-lite] model={args.model_name} | prompts={args.prompts_file} | labels={args.labels_csv} | out={args.out}"
+    )
+    print(
+        f"[TTT-lite] inner_steps={args.inner_steps} inner_lr={args.inner_lr} inner_max_tokens={args.inner_max_tokens} "
+        f"max_new_tokens={args.max_new_tokens} temperature={args.temperature} top_p={args.top_p}"
+    )
     model, tokenizer = _build_model_and_tokenizer(args)
+    print("[TTT-lite] Loading prompts and labels")
     labels = load_label_map(args.labels_csv)
     records = load_prompts(args.prompts_file)
+    print(f"[TTT-lite] Loaded prompt records: {len(records)} | label rows: {len(labels)}")
 
     test_records = []
     for rec in records:
@@ -73,12 +87,15 @@ def run(args) -> None:
 
     if not test_records:
         raise RuntimeError("No test records found from prompts + labels split.")
+    print(f"[TTT-lite] Test records to run: {len(test_records)}")
 
     named_params = _trainable_named_params(model)
+    print(f"[TTT-lite] Trainable params for inner update: {len(named_params)} tensors")
     optimizer = torch.optim.AdamW([p for _, p in named_params], lr=args.inner_lr)
 
     out_blocks: List[str] = []
     device = next(model.parameters()).device
+    print(f"[TTT-lite] Running on device: {device}")
     for i, rec in enumerate(test_records, 1):
         header = f"Prompt {rec.prompt_id}" if rec.prompt_id is not None else f"Prompt_{rec.idx}"
         prompt_text = render_chat_prompt(tokenizer, rec.system_prompt, rec.user_input)
@@ -117,12 +134,13 @@ def run(args) -> None:
         _restore_params(named_params, snap)
         optimizer.zero_grad(set_to_none=True)
 
-        if i % 20 == 0 or i == len(test_records):
-            print(f"TTT-lite done {i}/{len(test_records)}")
+        if i % 10 == 0 or i == len(test_records):
+            loss_val = float(loss.detach().cpu()) if "loss" in locals() else float("nan")
+            print(f"[TTT-lite] done {i}/{len(test_records)} | last_inner_loss={loss_val:.4f}")
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.writelines(out_blocks)
-    print(f"Saved TTT-lite predictions: {args.out}")
+    print(f"[TTT-lite] Saved predictions: {args.out}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,4 +174,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
