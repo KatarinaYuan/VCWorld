@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Dict, List, Tuple
 
 import torch
@@ -102,6 +103,7 @@ def run(args) -> None:
     optimizer = torch.optim.AdamW([p for _, p in named_params], lr=args.inner_lr)
 
     out_blocks: List[str] = []
+    failed_rows: List[str] = []
     device = next(model.parameters()).device
     print(f"[TTT-lite] Running on device: {device}")
     for i, rec in enumerate(test_records, 1):
@@ -111,44 +113,58 @@ def run(args) -> None:
         if args.inner_max_tokens > 0:
             prompt_ids = prompt_ids[-args.inner_max_tokens:]
 
-        # Inner adaptation on current test prompt.
+        # Inner adaptation + generation on current test prompt.
         snap = _snapshot_params(named_params)
         inner_input = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        for _ in range(args.inner_steps):
-            out = model(input_ids=inner_input, attention_mask=torch.ones_like(inner_input), labels=inner_input)
-            loss = out.loss
-            loss.backward()
-            optimizer.step()
+        loss = None
+        try:
+            for _ in range(args.inner_steps):
+                out = model(input_ids=inner_input, attention_mask=torch.ones_like(inner_input), labels=inner_input)
+                loss = out.loss
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            model.eval()
+            with torch.no_grad():
+                gen = model.generate(
+                    input_ids=inner_input,
+                    attention_mask=torch.ones_like(inner_input),
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.temperature > 0,
+                    temperature=max(args.temperature, 1e-5),
+                    top_p=args.top_p,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            new_tokens = gen[:, inner_input.shape[1]:]
+            response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
+            out_blocks.append(format_prediction_block(header, response))
+        except Exception as e:  # Keep long runs alive even if one sample fails on CUDA/runtime.
+            msg = str(e).replace("\t", " ").replace("\n", " ")
+            failed_rows.append(f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\t{msg}\n")
+            print(f"[TTT-lite][WARN] failed {i}/{len(test_records)} ({header}): {msg}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        finally:
+            model.train()
+            # Reset to base params for next sample.
+            _restore_params(named_params, snap)
             optimizer.zero_grad(set_to_none=True)
 
-        model.eval()
-        with torch.no_grad():
-            gen = model.generate(
-                input_ids=inner_input,
-                attention_mask=torch.ones_like(inner_input),
-                max_new_tokens=args.max_new_tokens,
-                do_sample=args.temperature > 0,
-                temperature=max(args.temperature, 1e-5),
-                top_p=args.top_p,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        new_tokens = gen[:, inner_input.shape[1]:]
-        response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
-        out_blocks.append(format_prediction_block(header, response))
-        model.train()
-
-        # Reset to base params for next sample.
-        _restore_params(named_params, snap)
-        optimizer.zero_grad(set_to_none=True)
-
         if i % 10 == 0 or i == len(test_records):
-            loss_val = float(loss.detach().cpu()) if "loss" in locals() else float("nan")
+            loss_val = float(loss.detach().cpu()) if loss is not None else float("nan")
             print(f"[TTT-lite] done {i}/{len(test_records)} | last_inner_loss={loss_val:.4f}")
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.writelines(out_blocks)
     print(f"[TTT-lite] Saved predictions: {args.out}")
+    if failed_rows:
+        failed_out = args.failed_out or f"{os.path.splitext(args.out)[0]}.failed.tsv"
+        with open(failed_out, "w", encoding="utf-8") as f:
+            f.write("sample_idx\theader\trecord_idx\tprompt_id\terror\n")
+            f.writelines(failed_rows)
+        print(f"[TTT-lite] Failed samples: {len(failed_rows)} | details: {failed_out}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -157,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompts-file", required=True)
     p.add_argument("--labels-csv", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--failed-out", default=None, help="Optional TSV for failed sample errors.")
     p.add_argument("--init-adapter", default=None, help="Optional LoRA adapter checkpoint as TTT init")
     p.add_argument("--inner-steps", type=int, default=3)
     p.add_argument("--inner-lr", type=float, default=5e-5)
