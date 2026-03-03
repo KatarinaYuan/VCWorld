@@ -9,6 +9,7 @@ import os
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -68,6 +69,35 @@ def _build_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def _score_label_candidates(
+    model,
+    device: torch.device,
+    prompt_ids: List[int],
+    prefix_ids: List[int],
+    candidate_id_lists: List[List[int]],
+) -> List[float]:
+    """Score each candidate by summed log-probability conditioned on prompt+prefix."""
+    scores: List[float] = []
+    base_ids = prompt_ids + prefix_ids
+    for cand_ids in candidate_id_lists:
+        if not cand_ids:
+            scores.append(float("-inf"))
+            continue
+        full_ids = base_ids + cand_ids
+        input_t = torch.tensor([full_ids], dtype=torch.long, device=device)
+        with torch.no_grad():
+            logits = model(input_ids=input_t, attention_mask=torch.ones_like(input_t)).logits
+            log_probs = F.log_softmax(logits, dim=-1)
+        # Token at position t is predicted from logits at t-1.
+        start = len(base_ids)
+        s = 0.0
+        for j, tok in enumerate(cand_ids):
+            pos = start + j - 1
+            s += float(log_probs[0, pos, tok].detach().cpu())
+        scores.append(s)
+    return scores
+
+
 @profile
 def run(args) -> None:
     print("[TTT-lite] ===== Run Config =====")
@@ -76,7 +106,8 @@ def run(args) -> None:
     )
     print(
         f"[TTT-lite] inner_steps={args.inner_steps} inner_lr={args.inner_lr} inner_max_tokens={args.inner_max_tokens} "
-        f"max_new_tokens={args.max_new_tokens} temperature={args.temperature} top_p={args.top_p}"
+        f"max_new_tokens={args.max_new_tokens} temperature={args.temperature} top_p={args.top_p} "
+        f"prediction_mode={args.prediction_mode}"
     )
     model, tokenizer = _build_model_and_tokenizer(args)
     print("[TTT-lite] Loading prompts and labels")
@@ -106,6 +137,14 @@ def run(args) -> None:
     failed_rows: List[str] = []
     device = next(model.parameters()).device
     print(f"[TTT-lite] Running on device: {device}")
+    label_candidates = [x.strip() for x in args.label_candidates.split(",") if x.strip()]
+    label_prefix_ids = tokenizer(args.label_prefix, add_special_tokens=False).input_ids
+    candidate_id_lists = [
+        tokenizer(" " + cand if not cand.startswith(" ") else cand, add_special_tokens=False).input_ids
+        for cand in label_candidates
+    ]
+    if args.prediction_mode == "label-ranking":
+        print(f"[TTT-lite] label-ranking candidates: {label_candidates}")
     for i, rec in enumerate(test_records, 1):
         header = f"Prompt {rec.prompt_id}" if rec.prompt_id is not None else f"Prompt_{rec.idx}"
         prompt_text = render_chat_prompt(tokenizer, rec.system_prompt, rec.user_input)
@@ -126,19 +165,35 @@ def run(args) -> None:
                 optimizer.zero_grad(set_to_none=True)
 
             model.eval()
-            with torch.no_grad():
-                gen = model.generate(
-                    input_ids=inner_input,
-                    attention_mask=torch.ones_like(inner_input),
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=args.temperature > 0,
-                    temperature=max(args.temperature, 1e-5),
-                    top_p=args.top_p,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
+            if args.prediction_mode == "label-ranking":
+                scores = _score_label_candidates(
+                    model=model,
+                    device=device,
+                    prompt_ids=prompt_ids,
+                    prefix_ids=label_prefix_ids,
+                    candidate_id_lists=candidate_id_lists,
                 )
-            new_tokens = gen[:, inner_input.shape[1]:]
-            response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
+                best_idx = max(range(len(scores)), key=lambda k: scores[k])
+                best_label = label_candidates[best_idx]
+                response = (
+                    "Final Deterministic Prediction:\n"
+                    f"{best_label}\n"
+                    f"[label_ranking_scores] {dict(zip(label_candidates, [round(s, 4) for s in scores]))}"
+                )
+            else:
+                with torch.no_grad():
+                    gen = model.generate(
+                        input_ids=inner_input,
+                        attention_mask=torch.ones_like(inner_input),
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=args.temperature > 0,
+                        temperature=max(args.temperature, 1e-5),
+                        top_p=args.top_p,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                new_tokens = gen[:, inner_input.shape[1]:]
+                response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
             out_blocks.append(format_prediction_block(header, response))
         except Exception as e:  # Keep long runs alive even if one sample fails on CUDA/runtime.
             msg = str(e).replace("\t", " ").replace("\n", " ")
@@ -181,6 +236,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument(
+        "--prediction-mode",
+        choices=["generate", "label-ranking"],
+        default="generate",
+        help="`generate` uses HF generation; `label-ranking` scores label candidates directly.",
+    )
+    p.add_argument(
+        "--label-candidates",
+        default="yes,no,insufficient",
+        help="Comma-separated candidate labels used in label-ranking mode.",
+    )
+    p.add_argument(
+        "--label-prefix",
+        default="\nFinal Deterministic Prediction:\n",
+        help="Prefix text before label candidates in label-ranking mode.",
+    )
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--lora-r", type=int, default=16)
