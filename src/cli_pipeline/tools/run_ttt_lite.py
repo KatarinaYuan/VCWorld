@@ -69,6 +69,19 @@ def _build_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def _is_fatal_cuda_error(msg: str) -> bool:
+    s = msg.lower()
+    fatal_patterns = (
+        "unspecified launch failure",
+        "device-side assert",
+        "cuda error",
+        "cublas",
+        "cudnn",
+        "nccl",
+    )
+    return any(p in s for p in fatal_patterns)
+
+
 def _score_label_candidates(
     model,
     device: torch.device,
@@ -135,6 +148,7 @@ def run(args) -> None:
 
     out_blocks: List[str] = []
     failed_rows: List[str] = []
+    fatal_cuda_encountered = False
     device = next(model.parameters()).device
     print(f"[TTT-lite] Running on device: {device}")
     label_candidates = [x.strip() for x in args.label_candidates.split(",") if x.strip()]
@@ -199,13 +213,30 @@ def run(args) -> None:
             msg = str(e).replace("\t", " ").replace("\n", " ")
             failed_rows.append(f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\t{msg}\n")
             print(f"[TTT-lite][WARN] failed {i}/{len(test_records)} ({header}): {msg}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            fatal_cuda_encountered = _is_fatal_cuda_error(msg)
+            if torch.cuda.is_available() and not fatal_cuda_encountered:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as cache_e:
+                    cache_msg = str(cache_e).replace("\t", " ").replace("\n", " ")
+                    print(f"[TTT-lite][WARN] empty_cache failed: {cache_msg}")
+                    fatal_cuda_encountered = True
         finally:
             model.train()
             # Reset to base params for next sample.
-            _restore_params(named_params, snap)
-            optimizer.zero_grad(set_to_none=True)
+            if not fatal_cuda_encountered:
+                try:
+                    _restore_params(named_params, snap)
+                    optimizer.zero_grad(set_to_none=True)
+                except Exception as restore_e:
+                    restore_msg = str(restore_e).replace("\t", " ").replace("\n", " ")
+                    failed_rows.append(f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\tRESTORE_FAILED: {restore_msg}\n")
+                    print(f"[TTT-lite][WARN] restore failed at {i}/{len(test_records)} ({header}): {restore_msg}")
+                    fatal_cuda_encountered = True
+
+        if fatal_cuda_encountered:
+            print("[TTT-lite][ERROR] Fatal CUDA state detected; stopping this run early. Please relaunch to continue.")
+            break
 
         if i % 10 == 0 or i == len(test_records):
             loss_val = float(loss.detach().cpu()) if loss is not None else float("nan")
