@@ -68,7 +68,7 @@ PYTHONUNBUFFERED=1 python -u tools/run_ttt_lite.py   \
   --model-name /projects/AI4D/core-132/PerturbReason_ckpt/Meta-Llama-3.2-3B-Instruct/  \
   --prompts-file "${PROMPTS_SHARD}"   \
   --labels-csv "${TRUTH_CSV}"   \
-  --out /projects/AI4D/core-132/PerturbReason_data/C32_DE_llama3b_ttt_lite_predictions_fast_labelpred_${tag}.txt   \
+  --out /projects/AI4D/core-132/PerturbReason_data/C32_DE_llama3b_ttt_lite_fast_labelpred_predictions_${tag}.txt   \
   --inner-steps 1   --inner-lr 5e-5   --inner-max-tokens 4096   \
   --prediction-mode label-ranking   --label-candidates yes,no,insufficient   \
   --temperature 0.6   --top-p 0.9   --lora-r 16   --lora-alpha 32   \

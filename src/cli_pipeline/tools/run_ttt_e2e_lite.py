@@ -9,10 +9,11 @@ import os
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ttt_common import load_label_map, load_prompts, render_chat_prompt
+from ttt_common import format_prediction_block, load_label_map, load_prompts, render_chat_prompt
 
 # kernprof injects `profile` into builtins; provide a no-op fallback for normal runs.
 try:
@@ -86,6 +87,117 @@ def _build_train_sequences(args, tokenizer) -> List[List[int]]:
     return seqs
 
 
+def _build_test_records(args):
+    labels = load_label_map(args.labels_csv)
+    records = load_prompts(args.prompts_file)
+    test_records = []
+    for rec in records:
+        if not rec.pert or not rec.gene or not rec.system_prompt or not rec.user_input:
+            continue
+        row = labels.get((rec.pert, rec.gene))
+        if row is None or row.get("split", "").strip().lower() != "test":
+            continue
+        test_records.append(rec)
+    return test_records
+
+
+def _score_label_candidates(
+    model,
+    device: torch.device,
+    prompt_ids: List[int],
+    prefix_ids: List[int],
+    candidate_id_lists: List[List[int]],
+) -> List[float]:
+    scores: List[float] = []
+    base_ids = prompt_ids + prefix_ids
+    for cand_ids in candidate_id_lists:
+        if not cand_ids:
+            scores.append(float("-inf"))
+            continue
+        full_ids = base_ids + cand_ids
+        input_t = torch.tensor([full_ids], dtype=torch.long, device=device)
+        with torch.no_grad():
+            logits = model(input_ids=input_t, attention_mask=torch.ones_like(input_t)).logits
+            log_probs = F.log_softmax(logits, dim=-1)
+        start = len(base_ids)
+        s = 0.0
+        for j, tok in enumerate(cand_ids):
+            pos = start + j - 1
+            s += float(log_probs[0, pos, tok].detach().cpu())
+        scores.append(s)
+    return scores
+
+
+def _run_prediction(args, model, tokenizer) -> None:
+    if not args.predictions_out:
+        raise RuntimeError("--predictions-out is required when --run-predict is enabled.")
+    test_records = _build_test_records(args)
+    if not test_records:
+        raise RuntimeError("No test records found for prediction.")
+
+    print(
+        f"[TTT-E2E-lite] Prediction phase | records={len(test_records)} "
+        f"mode={args.prediction_mode} out={args.predictions_out}"
+    )
+    model.eval()
+    device = next(model.parameters()).device
+    label_candidates = [x.strip() for x in args.label_candidates.split(",") if x.strip()]
+    label_prefix_ids = tokenizer(args.label_prefix, add_special_tokens=False).input_ids
+    candidate_id_lists = [
+        tokenizer(" " + cand if not cand.startswith(" ") else cand, add_special_tokens=False).input_ids
+        for cand in label_candidates
+    ]
+    if args.prediction_mode == "label-ranking":
+        print(f"[TTT-E2E-lite] label-ranking candidates: {label_candidates}")
+
+    out_blocks: List[str] = []
+    for i, rec in enumerate(test_records, 1):
+        header = f"Prompt {rec.prompt_id}" if rec.prompt_id is not None else f"Prompt_{rec.idx}"
+        prompt_text = render_chat_prompt(tokenizer, rec.system_prompt, rec.user_input)
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
+        if args.predict_max_input_tokens > 0:
+            prompt_ids = prompt_ids[-args.predict_max_input_tokens:]
+        prompt_input = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+        if args.prediction_mode == "label-ranking":
+            scores = _score_label_candidates(
+                model=model,
+                device=device,
+                prompt_ids=prompt_ids,
+                prefix_ids=label_prefix_ids,
+                candidate_id_lists=candidate_id_lists,
+            )
+            best_idx = max(range(len(scores)), key=lambda k: scores[k])
+            best_label = label_candidates[best_idx]
+            response = (
+                "Final Deterministic Prediction:\n"
+                f"{best_label}\n"
+                f"[label_ranking_scores] {dict(zip(label_candidates, [round(s, 4) for s in scores]))}"
+            )
+        else:
+            with torch.no_grad():
+                gen = model.generate(
+                    input_ids=prompt_input,
+                    attention_mask=torch.ones_like(prompt_input),
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.temperature > 0,
+                    temperature=max(args.temperature, 1e-5),
+                    top_p=args.top_p,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            new_tokens = gen[:, prompt_input.shape[1]:]
+            response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
+
+        out_blocks.append(format_prediction_block(header, response))
+        if i % args.predict_log_every == 0 or i == len(test_records):
+            print(f"[TTT-E2E-lite] prediction done {i}/{len(test_records)}")
+
+    with open(args.predictions_out, "w", encoding="utf-8") as f:
+        f.writelines(out_blocks)
+    print(f"[TTT-E2E-lite] Saved predictions: {args.predictions_out}")
+
+
 @profile
 def run(args) -> None:
     print("[TTT-E2E-lite] ===== Run Config =====")
@@ -101,6 +213,8 @@ def run(args) -> None:
     model.train()
     print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
+    import ipdb
+    ipdb.set_trace()
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
     print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")
@@ -194,6 +308,8 @@ def run(args) -> None:
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[TTT-E2E-lite] Saved final adapter: {args.output_dir}")
+    if args.run_predict:
+        _run_prediction(args, model, tokenizer)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,6 +327,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inner-max-tokens", type=int, default=2048)
     p.add_argument("--chunk-tokens", type=int, default=1024, help="Chunk size for inner scan / outer averaging.")
     p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--run-predict", action="store_true", help="Run prediction on test split after training.")
+    p.add_argument("--predictions-out", default=None, help="Output file for post-train predictions.")
+    p.add_argument("--predict-log-every", type=int, default=20)
+    p.add_argument("--predict-max-input-tokens", type=int, default=4096)
+    p.add_argument("--max-new-tokens", type=int, default=512)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument(
+        "--prediction-mode",
+        choices=["generate", "label-ranking"],
+        default="label-ranking",
+        help="Post-train prediction mode: text generation or fast label ranking.",
+    )
+    p.add_argument("--label-candidates", default="yes,no,insufficient")
+    p.add_argument("--label-prefix", default="\nFinal Deterministic Prediction:\n")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--lora-r", type=int, default=16)

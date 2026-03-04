@@ -230,7 +230,9 @@ def run(args) -> None:
                     optimizer.zero_grad(set_to_none=True)
                 except Exception as restore_e:
                     restore_msg = str(restore_e).replace("\t", " ").replace("\n", " ")
-                    failed_rows.append(f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\tRESTORE_FAILED: {restore_msg}\n")
+                    failed_rows.append(
+                        f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\tRESTORE_FAILED: {restore_msg}\n"
+                    )
                     print(f"[TTT-lite][WARN] restore failed at {i}/{len(test_records)} ({header}): {restore_msg}")
                     fatal_cuda_encountered = True
 
@@ -271,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prediction-mode",
         choices=["generate", "label-ranking"],
         default="generate",
-        help="`generate` uses HF generation; `label-ranking` scores label candidates directly.",
+        help="`generate` uses HF generation; `label-ranking` scores labels directly.",
     )
     p.add_argument(
         "--label-candidates",
