@@ -198,7 +198,12 @@ def build_retrieval_results(*, data_csv: str, drug_sim_json: str, out_json: str,
             seed=seed,
         )
         results.append({
-            "test_case": {"drug": drug, "gene": gene},
+            "test_case": {
+                "drug": drug,
+                "gene": gene,
+                "label": int(item["label"]),
+                "split": item["split"],
+            },
             "retrieved_pairs": retrieved,
         })
 

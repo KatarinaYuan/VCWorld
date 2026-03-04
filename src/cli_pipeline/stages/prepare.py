@@ -11,6 +11,21 @@ import scanpy as sc
 from tqdm import tqdm
 
 
+def _print_split_stats(df: pd.DataFrame, name: str) -> None:
+    total_rows = len(df)
+    train_rows = int((df["split"] == "train").sum())
+    test_rows = int((df["split"] == "test").sum())
+    train_perts = int(df.loc[df["split"] == "train", "pert"].nunique())
+    test_perts = int(df.loc[df["split"] == "test", "pert"].nunique())
+    train_genes = int(df.loc[df["split"] == "train", "gene"].nunique())
+    test_genes = int(df.loc[df["split"] == "test", "gene"].nunique())
+
+    print(f"{name} stats:")
+    print(f"  rows total/train/test: {total_rows}/{train_rows}/{test_rows}")
+    print(f"  unique perts train/test: {train_perts}/{test_perts}")
+    print(f"  unique genes train/test: {train_genes}/{test_genes}")
+
+
 def process_cell_line(
     *,
     adata_path: str,
@@ -19,6 +34,9 @@ def process_cell_line(
     perturbation_col: str = "drug",
     control_value: str = "DMSO_TF",
     train_fraction: float = 0.3,
+    split_mode: str = "random_perturbation",
+    k_support_perturbations: Optional[int] = None,
+    m_genes_per_perturbation: Optional[int] = None,
     seed: int = 42,
     fdr: float = 0.05,
     lfc: float = 0.25,
@@ -39,6 +57,18 @@ def process_cell_line(
         print(f"ERROR: file not found: {adata_path}")
         return
 
+    if perturbation_col not in adata.obs:
+        raise ValueError(f"Column '{perturbation_col}' not found in adata.obs")
+
+    print("Raw data stats:")
+    print(f"  obs: {adata.n_obs}, vars: {adata.n_vars}")
+    print(f"  perturbation column: {perturbation_col}")
+    print(f"  unique perturbations (incl control): {adata.obs[perturbation_col].nunique()}")
+    pert_counts = adata.obs[perturbation_col].value_counts()
+    control_cells = int((adata.obs[perturbation_col] == control_value).sum())
+    print(f"  control value: {control_value}, control cells: {control_cells}")
+    print(f"  perturbation cells min/median/max: {int(pert_counts.min())}/{float(pert_counts.median()):.1f}/{int(pert_counts.max())}")
+
     print("Preprocessing...")
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
@@ -46,6 +76,12 @@ def process_cell_line(
     print("Running DE...")
     all_perturbations = adata.obs[perturbation_col].unique()
     drug_perturbations = [p for p in all_perturbations if p != control_value]
+    drug_cell_counts = adata.obs[adata.obs[perturbation_col] != control_value][perturbation_col].value_counts()
+    if len(drug_cell_counts) > 0:
+        print(
+            "Drug perturbation cell stats min/median/max: "
+            f"{int(drug_cell_counts.min())}/{float(drug_cell_counts.median()):.1f}/{int(drug_cell_counts.max())}"
+        )
 
     if not drug_perturbations:
         print("WARNING: no perturbations found; skip")
@@ -82,14 +118,31 @@ def process_cell_line(
 
     results_df = pd.concat(results_list, ignore_index=True)
 
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     perturbations_shuffled = drug_perturbations.copy()
-    np.random.shuffle(perturbations_shuffled)
-    split_index = int(len(perturbations_shuffled) * train_fraction)
-    train_set = set(perturbations_shuffled[:split_index])
-    test_set = set(perturbations_shuffled[split_index:])
+    rng.shuffle(perturbations_shuffled)
+
+    if split_mode == "random_perturbation":
+        split_index = int(len(perturbations_shuffled) * train_fraction)
+        train_set = set(perturbations_shuffled[:split_index])
+        test_set = set(perturbations_shuffled[split_index:])
+    elif split_mode == "k_perturbation_fixed_genes":
+        if k_support_perturbations is None or m_genes_per_perturbation is None:
+            raise ValueError(
+                "split_mode=k_perturbation_fixed_genes requires "
+                "--k-support-perturbations and --m-genes-per-perturbation."
+            )
+        if k_support_perturbations <= 0 or m_genes_per_perturbation <= 0:
+            raise ValueError("k_support_perturbations and m_genes_per_perturbation must be > 0.")
+        k = min(k_support_perturbations, len(perturbations_shuffled))
+        train_set = set(perturbations_shuffled[:k])
+        test_set = set(perturbations_shuffled[k:])
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode}")
+
     results_df["split"] = results_df["pert"].map(lambda p: "train" if p in train_set else "test")
 
+    print(f"Split mode: {split_mode}")
     print(f"Total perturbations: {len(drug_perturbations)}")
     print(f"Train perturbations: {len(train_set)} | Test perturbations: {len(test_set)}")
 
@@ -97,8 +150,10 @@ def process_cell_line(
     degs_mask = (results_df["pvals_adj"] < fdr) & (results_df["logfoldchanges"].abs() > lfc)
     degs_df = results_df[degs_mask].copy()
     degs_df["label"] = 1
+    print(f"DE positives: {len(degs_df)}")
 
     non_degs_candidates = results_df[results_df["pvals"] > pval_neg]
+    print(f"DE negatives candidate pool: {len(non_degs_candidates)}")
 
     def sample_group(group, n_samples):
         n = min(n_samples, len(group))
@@ -111,8 +166,31 @@ def process_cell_line(
         final_labels_df = pd.concat([degs_df, non_degs_df], ignore_index=True)
     else:
         final_labels_df = degs_df
+    label_counts = final_labels_df["label"].value_counts(dropna=False).to_dict()
+    print(f"DE label counts before A2 resampling: {label_counts}")
+
+    if split_mode == "k_perturbation_fixed_genes":
+        m = int(m_genes_per_perturbation)
+        train_rows = final_labels_df[final_labels_df["pert"].isin(train_set)]
+        sampled_train_rows = (
+            train_rows.groupby("pert", group_keys=False)
+            .apply(lambda g: g.sample(n=min(m, len(g)), random_state=seed))
+            .copy()
+        )
+
+        sampled_train_rows["split"] = "train"
+        test_rows = final_labels_df[~final_labels_df["pert"].isin(train_set)].copy()
+        test_rows["split"] = "test"
+        final_labels_df = pd.concat([sampled_train_rows, test_rows], ignore_index=True)
+
+        realized_train_n = int((final_labels_df["split"] == "train").sum())
+        print(
+            f"A2 sampling: target train tuples = {len(train_set)} * {m} = {len(train_set) * m}, "
+            f"realized train tuples = {realized_train_n}"
+        )
 
     final_labels_df = final_labels_df[["pert", "gene", "label", "split"]]
+    _print_split_stats(final_labels_df, "DE")
 
     os.makedirs(output_dir, exist_ok=True)
     de_output = os.path.join(output_dir, f"{cell_line_name}_DE.csv")
@@ -123,6 +201,27 @@ def process_cell_line(
     degs_df["direction_label"] = np.where(degs_df["logfoldchanges"] > 0, 1, 0)
     dir_labels_df = degs_df[["pert", "gene", "direction_label", "split"]].copy()
     dir_labels_df.rename(columns={"direction_label": "label"}, inplace=True)
+
+    if split_mode == "k_perturbation_fixed_genes":
+        m = int(m_genes_per_perturbation)
+        dir_train_rows = dir_labels_df[dir_labels_df["pert"].isin(train_set)]
+        sampled_dir_train_rows = (
+            dir_train_rows.groupby("pert", group_keys=False)
+            .apply(lambda g: g.sample(n=min(m, len(g)), random_state=seed))
+            .copy()
+        )
+        sampled_dir_train_rows["split"] = "train"
+        dir_test_rows = dir_labels_df[~dir_labels_df["pert"].isin(train_set)].copy()
+        dir_test_rows["split"] = "test"
+        dir_labels_df = pd.concat([sampled_dir_train_rows, dir_test_rows], ignore_index=True)
+
+        realized_dir_train_n = int((dir_labels_df["split"] == "train").sum())
+        print(
+            f"A2 sampling (DIR): target train tuples = {len(train_set)} * {m} = {len(train_set) * m}, "
+            f"realized train tuples = {realized_dir_train_n}"
+        )
+
+    _print_split_stats(dir_labels_df, "DIR")
 
     dir_output = os.path.join(output_dir, f"{cell_line_name}_DIR.csv")
     dir_labels_df.to_csv(dir_output, index=False)

@@ -21,6 +21,16 @@ def _add_prepare_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--perturbation-col", default="drug", help="AnnData obs column for perturbation")
     p.add_argument("--control-value", default="DMSO_TF", help="Control group name")
     p.add_argument("--train-fraction", type=float, default=0.3, help="Train split fraction")
+    p.add_argument(
+        "--split-mode",
+        default="random_perturbation",
+        choices=["random_perturbation", "k_perturbation_fixed_genes"],
+        help="Train/test split strategy",
+    )
+    p.add_argument("--k-support-perturbations", type=int, default=None,
+                   help="Number of support perturbations for k_perturbation_fixed_genes")
+    p.add_argument("--m-genes-per-perturbation", type=int, default=None,
+                   help="Number of training tuples sampled per support perturbation")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fdr", type=float, default=0.05)
     p.add_argument("--lfc", type=float, default=0.25)
@@ -48,6 +58,10 @@ def _add_prompt_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cell-line-idx", type=int, default=None)
     p.add_argument("--max-cases", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--include-gold-label", action="store_true",
+                   help="Inject gold label into [Start of Output] block (for training prompts).")
+    p.add_argument("--labels-csv", default=None,
+                   help="Optional CSV with pert/gene/label for fallback label lookup in prompt stage.")
 
 
 def _add_infer_args(p: argparse.ArgumentParser) -> None:
@@ -166,6 +180,9 @@ def main(argv: list[str]) -> int:
             perturbation_col=args.perturbation_col,
             control_value=args.control_value,
             train_fraction=args.train_fraction,
+            split_mode=args.split_mode,
+            k_support_perturbations=args.k_support_perturbations,
+            m_genes_per_perturbation=args.m_genes_per_perturbation,
             seed=args.seed,
             fdr=args.fdr,
             lfc=args.lfc,
@@ -198,6 +215,8 @@ def main(argv: list[str]) -> int:
             cell_line_idx=args.cell_line_idx,
             max_cases=args.max_cases,
             seed=args.seed,
+            include_gold_label=args.include_gold_label,
+            labels_csv=args.labels_csv,
         )
         return 0
 
