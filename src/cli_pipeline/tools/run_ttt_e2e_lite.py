@@ -36,7 +36,7 @@ def _restore_params(named_params: List[Tuple[str, torch.nn.Parameter]], snap: Di
         p.data.copy_(snap[n].data)
 
 
-def _build_model_and_tokenizer(args):
+def _build_model_and_tokenizer(args, init_adapter_override: str | None = None):
     print(f"[TTT-E2E-lite] Loading tokenizer from: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
@@ -50,9 +50,10 @@ def _build_model_and_tokenizer(args):
         trust_remote_code=args.trust_remote_code,
     )
 
-    if args.init_adapter:
-        print(f"[TTT-E2E-lite] Loading initial adapter: {args.init_adapter}")
-        model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+    init_adapter = init_adapter_override if init_adapter_override is not None else args.init_adapter
+    if init_adapter:
+        print(f"[TTT-E2E-lite] Loading initial adapter: {init_adapter}")
+        model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True)
     else:
         print("[TTT-E2E-lite] Initializing fresh LoRA adapter")
         lora_cfg = LoraConfig(
@@ -246,12 +247,20 @@ def run(args) -> None:
     )
     wandb_run, wandb_mod = _init_wandb(args)
     os.makedirs(args.output_dir, exist_ok=True)
-    model, tokenizer = _build_model_and_tokenizer(args)
+    init_adapter = args.predict_ckpt if args.predict_ckpt else args.init_adapter
+    model, tokenizer = _build_model_and_tokenizer(args, init_adapter_override=init_adapter)
     model.train()
+    if args.predict_only:
+        if not args.run_predict:
+            raise RuntimeError("--predict-only requires --run-predict.")
+        print("[TTT-E2E-lite] predict-only mode: skip training and run prediction only.")
+        _run_prediction(args, model, tokenizer, wandb_run=wandb_run, wandb_mod=wandb_mod)
+        if wandb_run is not None:
+            wandb_run.finish()
+        return
+
     print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
-    #import ipdb
-    #ipdb.set_trace()
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
     print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")
@@ -329,6 +338,15 @@ def run(args) -> None:
             total_outer += float(outer_loss.detach().cpu())
             n_effective += 1
             global_step += 1
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                step_ckpt_dir = os.path.join(args.output_dir, f"step_{global_step:07d}")
+                model.save_pretrained(step_ckpt_dir)
+                tokenizer.save_pretrained(step_ckpt_dir)
+                print(f"[TTT-E2E-lite] Saved step checkpoint: {step_ckpt_dir}")
+                if wandb_run is not None and wandb_mod is not None and args.wandb_log_artifacts:
+                    artifact = wandb_mod.Artifact(f"ttt-e2e-step-{global_step}", type="model")
+                    artifact.add_dir(step_ckpt_dir)
+                    wandb_run.log_artifact(artifact)
             if i % args.log_every == 0:
                 avg_outer = total_outer / max(1, i)
                 cur_outer = float(outer_loss.detach().cpu())
@@ -394,6 +412,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--labels-csv", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--init-adapter", default=None, help="Optional LoRA adapter checkpoint as init")
+    p.add_argument("--predict-only", action="store_true", help="Skip training and run prediction only.")
+    p.add_argument("--predict-ckpt", default=None, help="Adapter checkpoint directory to load for predict-only mode.")
     p.add_argument("--num-epochs", type=int, default=1)
     p.add_argument("--inner-steps", type=int, default=1)
     p.add_argument("--inner-lr", type=float, default=5e-5)
@@ -402,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inner-max-tokens", type=int, default=2048)
     p.add_argument("--chunk-tokens", type=int, default=1024, help="Chunk size for inner scan / outer averaging.")
     p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--save-every-steps", type=int, default=0, help="Save checkpoint every N training steps (0 disables).")
     p.add_argument("--run-predict", action="store_true", help="Run prediction on test split after training.")
     p.add_argument("--predictions-out", default=None, help="Output file for post-train predictions.")
     p.add_argument("--predict-log-every", type=int, default=20)

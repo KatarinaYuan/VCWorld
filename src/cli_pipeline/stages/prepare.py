@@ -37,6 +37,8 @@ def process_cell_line(
     split_mode: str = "random_perturbation",
     k_support_perturbations: Optional[int] = None,
     m_genes_per_perturbation: Optional[int] = None,
+    fixed_test_fraction: Optional[float] = None,
+    fixed_test_seed: Optional[int] = None,
     seed: int = 42,
     fdr: float = 0.05,
     lfc: float = 0.25,
@@ -134,9 +136,39 @@ def process_cell_line(
             )
         if k_support_perturbations <= 0 or m_genes_per_perturbation <= 0:
             raise ValueError("k_support_perturbations and m_genes_per_perturbation must be > 0.")
-        k = min(k_support_perturbations, len(perturbations_shuffled))
-        train_set = set(perturbations_shuffled[:k])
-        test_set = set(perturbations_shuffled[k:])
+        if fixed_test_fraction is not None:
+            if not 0.0 < fixed_test_fraction < 1.0:
+                raise ValueError("fixed_test_fraction must be in (0, 1).")
+            if len(perturbations_shuffled) < 2:
+                raise ValueError("Need at least 2 perturbations to build disjoint train/test.")
+
+            test_rng_seed = seed if fixed_test_seed is None else fixed_test_seed
+            test_rng = np.random.default_rng(test_rng_seed)
+            perturbations_for_test = drug_perturbations.copy()
+            test_rng.shuffle(perturbations_for_test)
+
+            n_total = len(perturbations_for_test)
+            n_test = int(round(n_total * fixed_test_fraction))
+            n_test = max(1, min(n_total - 1, n_test))
+            print("Split fixed test data: n_total: ", n_total, "n_test: ", n_test)
+
+            test_set = set(perturbations_for_test[:n_test])
+            support_pool = [p for p in perturbations_for_test if p not in test_set]
+            if k_support_perturbations > len(support_pool):
+                raise ValueError(
+                    f"k_support_perturbations={k_support_perturbations} exceeds support pool "
+                    f"size={len(support_pool)} after fixed test split."
+                )
+            train_set = set(support_pool[:k_support_perturbations])
+            print(
+                "Fixed test enabled: "
+                f"fraction={fixed_test_fraction}, test_seed={test_rng_seed}, "
+                f"test_perts={len(test_set)}, support_pool={len(support_pool)}"
+            )
+        else:
+            k = min(k_support_perturbations, len(perturbations_shuffled))
+            train_set = set(perturbations_shuffled[:k])
+            test_set = set(perturbations_shuffled[k:])
     else:
         raise ValueError(f"Unknown split_mode: {split_mode}")
 

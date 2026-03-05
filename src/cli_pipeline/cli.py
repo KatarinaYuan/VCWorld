@@ -31,6 +31,21 @@ def _add_prepare_args(p: argparse.ArgumentParser) -> None:
                    help="Number of support perturbations for k_perturbation_fixed_genes")
     p.add_argument("--m-genes-per-perturbation", type=int, default=None,
                    help="Number of training tuples sampled per support perturbation")
+    p.add_argument(
+        "--fixed-test-fraction",
+        type=float,
+        default=None,
+        help=(
+            "When split-mode is k_perturbation_fixed_genes, optionally fix test perturbations "
+            "by this fraction (e.g., 0.7). Keeps test set unchanged across k/m sweeps."
+        ),
+    )
+    p.add_argument(
+        "--fixed-test-seed",
+        type=int,
+        default=None,
+        help="Seed for selecting fixed test perturbations (defaults to --seed when omitted).",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fdr", type=float, default=0.05)
     p.add_argument("--lfc", type=float, default=0.25)
@@ -183,6 +198,8 @@ def main(argv: list[str]) -> int:
             split_mode=args.split_mode,
             k_support_perturbations=args.k_support_perturbations,
             m_genes_per_perturbation=args.m_genes_per_perturbation,
+            fixed_test_fraction=args.fixed_test_fraction,
+            fixed_test_seed=args.fixed_test_seed,
             seed=args.seed,
             fdr=args.fdr,
             lfc=args.lfc,
