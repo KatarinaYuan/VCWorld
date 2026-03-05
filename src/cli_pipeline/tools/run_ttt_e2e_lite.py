@@ -67,6 +67,28 @@ def _build_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def _init_wandb(args):
+    if not args.wandb:
+        return None, None
+    try:
+        import wandb
+    except ImportError as e:
+        raise RuntimeError(
+            "wandb logging requested but wandb is not installed. Install with `pip install wandb`."
+        ) from e
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_run_name or None,
+        group=args.wandb_group or None,
+        dir=args.wandb_dir or None,
+        mode="offline" if args.wandb_offline else "online",
+        config=vars(args),
+    )
+    return run, wandb
+
+
 def _build_train_sequences(args, tokenizer) -> List[List[int]]:
     labels = load_label_map(args.labels_csv)
     records = load_prompts(args.prompts_file)
@@ -128,7 +150,7 @@ def _score_label_candidates(
     return scores
 
 
-def _run_prediction(args, model, tokenizer) -> None:
+def _run_prediction(args, model, tokenizer, wandb_run=None, wandb_mod=None) -> None:
     if not args.predictions_out:
         raise RuntimeError("--predictions-out is required when --run-predict is enabled.")
     test_records = _build_test_records(args)
@@ -192,10 +214,24 @@ def _run_prediction(args, model, tokenizer) -> None:
         out_blocks.append(format_prediction_block(header, response))
         if i % args.predict_log_every == 0 or i == len(test_records):
             print(f"[TTT-E2E-lite] prediction done {i}/{len(test_records)}")
+            if wandb_run is not None and wandb_mod is not None:
+                wandb_mod.log(
+                    {
+                        "predict/processed": i,
+                        "predict/total": len(test_records),
+                        "predict/progress": i / max(1, len(test_records)),
+                    }
+                )
 
     with open(args.predictions_out, "w", encoding="utf-8") as f:
         f.writelines(out_blocks)
     print(f"[TTT-E2E-lite] Saved predictions: {args.predictions_out}")
+    if wandb_run is not None and wandb_mod is not None:
+        wandb_mod.log({"predict/num_outputs": len(out_blocks)})
+        if args.wandb_log_artifacts:
+            artifact = wandb_mod.Artifact("ttt-e2e-predictions", type="predictions")
+            artifact.add_file(args.predictions_out)
+            wandb_run.log_artifact(artifact)
 
 
 @profile
@@ -208,16 +244,19 @@ def run(args) -> None:
         f"[TTT-E2E-lite] epochs={args.num_epochs} inner_steps={args.inner_steps} inner_lr={args.inner_lr} "
         f"outer_lr={args.outer_lr} chunk_tokens={args.chunk_tokens} max_seq_len={args.max_seq_len}"
     )
+    wandb_run, wandb_mod = _init_wandb(args)
     os.makedirs(args.output_dir, exist_ok=True)
     model, tokenizer = _build_model_and_tokenizer(args)
     model.train()
     print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
-    import ipdb
-    ipdb.set_trace()
+    #import ipdb
+    #ipdb.set_trace()
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
     print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")
+    if wandb_run is not None and wandb_mod is not None:
+        wandb_mod.log({"meta/train_sequences": len(seqs)})
 
     named_params = _trainable_named_params(model)
     print(f"[TTT-E2E-lite] Trainable params: {len(named_params)} tensors")
@@ -225,6 +264,7 @@ def run(args) -> None:
     outer_opt = torch.optim.AdamW([p for _, p in named_params], lr=args.outer_lr)
     device = next(model.parameters()).device
     print(f"[TTT-E2E-lite] Running on device: {device}")
+    global_step = 0
 
     for epoch in range(1, args.num_epochs + 1):
         print(f"[TTT-E2E-lite] ---- Epoch {epoch}/{args.num_epochs} start ----")
@@ -288,12 +328,28 @@ def run(args) -> None:
 
             total_outer += float(outer_loss.detach().cpu())
             n_effective += 1
+            global_step += 1
             if i % args.log_every == 0:
                 avg_outer = total_outer / max(1, i)
+                cur_outer = float(outer_loss.detach().cpu())
+                cur_inner = float(inner_loss.detach().cpu())
                 print(
                     f"[TTT-E2E-lite] epoch={epoch} step={i}/{len(seqs)} chunks={len(chunks)} "
-                    f"outer_loss={float(outer_loss.detach().cpu()):.4f} avg_outer_loss={avg_outer:.4f}"
+                    f"outer_loss={cur_outer:.4f} avg_outer_loss={avg_outer:.4f} inner_loss={cur_inner:.4f}"
                 )
+                if wandb_run is not None and wandb_mod is not None:
+                    wandb_mod.log(
+                        {
+                            "train/epoch": epoch,
+                            "train/step_in_epoch": i,
+                            "train/global_step": global_step,
+                            "train/chunks_per_seq": len(chunks),
+                            "train/inner_loss": cur_inner,
+                            "train/outer_loss": cur_outer,
+                            "train/avg_outer_loss": avg_outer,
+                        },
+                        step=global_step,
+                    )
 
         ckpt_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
         model.save_pretrained(ckpt_dir)
@@ -304,12 +360,31 @@ def run(args) -> None:
             f"| avg_outer_loss={avg_epoch_outer:.4f}"
         )
         print(f"[TTT-E2E-lite] Saved epoch checkpoint: {ckpt_dir}")
+        if wandb_run is not None and wandb_mod is not None:
+            wandb_mod.log(
+                {
+                    "epoch/index": epoch,
+                    "epoch/effective_steps": n_effective,
+                    "epoch/avg_outer_loss": avg_epoch_outer,
+                },
+                step=global_step,
+            )
+            if args.wandb_log_artifacts:
+                artifact = wandb_mod.Artifact(f"ttt-e2e-epoch-{epoch}", type="model")
+                artifact.add_dir(ckpt_dir)
+                wandb_run.log_artifact(artifact)
 
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[TTT-E2E-lite] Saved final adapter: {args.output_dir}")
+    if wandb_run is not None and wandb_mod is not None and args.wandb_log_artifacts:
+        artifact = wandb_mod.Artifact("ttt-e2e-final", type="model")
+        artifact.add_dir(args.output_dir)
+        wandb_run.log_artifact(artifact)
     if args.run_predict:
-        _run_prediction(args, model, tokenizer)
+        _run_prediction(args, model, tokenizer, wandb_run=wandb_run, wandb_mod=wandb_mod)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -350,6 +425,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     p.add_argument("--line-profile", action="store_true", help="Enable line_profiler for run().")
     p.add_argument("--line-profile-out", default=None, help="Optional output file for line_profiler stats.")
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb-project", default="vcworld-ttt-e2e-lite")
+    p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--wandb-group", default=None)
+    p.add_argument("--wandb-dir", default=None)
+    p.add_argument("--wandb-offline", action="store_true", help="Use offline W&B logging.")
+    p.add_argument("--wandb-log-artifacts", action="store_true", help="Upload checkpoints/predictions as artifacts.")
     return p
 
 
