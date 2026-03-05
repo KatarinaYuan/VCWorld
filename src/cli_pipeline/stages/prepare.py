@@ -26,6 +26,22 @@ def _print_split_stats(df: pd.DataFrame, name: str) -> None:
     print(f"  unique genes train/test: {train_genes}/{test_genes}")
 
 
+def _sample_n_per_pert(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    rng = np.random.default_rng(seed)
+    tmp = df.copy()
+    tmp["_rand"] = rng.random(len(tmp))
+    sampled = (
+        tmp.sort_values(["pert", "_rand"])
+        .groupby("pert", group_keys=False)
+        .head(n)
+        .drop(columns="_rand")
+        .copy()
+    )
+    return sampled
+
+
 def process_cell_line(
     *,
     adata_path: str,
@@ -39,6 +55,8 @@ def process_cell_line(
     m_genes_per_perturbation: Optional[int] = None,
     fixed_test_fraction: Optional[float] = None,
     fixed_test_seed: Optional[int] = None,
+    output_tag: Optional[str] = None,
+    overwrite: bool = False,
     seed: int = 42,
     fdr: float = 0.05,
     lfc: float = 0.25,
@@ -124,6 +142,7 @@ def process_cell_line(
     perturbations_shuffled = drug_perturbations.copy()
     rng.shuffle(perturbations_shuffled)
 
+    unused_set = set()
     if split_mode == "random_perturbation":
         split_index = int(len(perturbations_shuffled) * train_fraction)
         train_set = set(perturbations_shuffled[:split_index])
@@ -160,10 +179,11 @@ def process_cell_line(
                     f"size={len(support_pool)} after fixed test split."
                 )
             train_set = set(support_pool[:k_support_perturbations])
+            unused_set = set(support_pool[k_support_perturbations:])
             print(
                 "Fixed test enabled: "
                 f"fraction={fixed_test_fraction}, test_seed={test_rng_seed}, "
-                f"test_perts={len(test_set)}, support_pool={len(support_pool)}"
+                f"test_perts={len(test_set)}, support_pool={len(support_pool)}, unused_perts={len(unused_set)}"
             )
         else:
             k = min(k_support_perturbations, len(perturbations_shuffled))
@@ -172,11 +192,20 @@ def process_cell_line(
     else:
         raise ValueError(f"Unknown split_mode: {split_mode}")
 
-    results_df["split"] = results_df["pert"].map(lambda p: "train" if p in train_set else "test")
+    def _assign_split(pert: str) -> str:
+        if pert in train_set:
+            return "train"
+        if pert in test_set:
+            return "test"
+        return "unused"
+
+    results_df["split"] = results_df["pert"].map(_assign_split)
 
     print(f"Split mode: {split_mode}")
     print(f"Total perturbations: {len(drug_perturbations)}")
     print(f"Train perturbations: {len(train_set)} | Test perturbations: {len(test_set)}")
+    if unused_set:
+        print(f"Unused perturbations: {len(unused_set)}")
 
     # Build DE dataset
     degs_mask = (results_df["pvals_adj"] < fdr) & (results_df["logfoldchanges"].abs() > lfc)
@@ -187,11 +216,7 @@ def process_cell_line(
     non_degs_candidates = results_df[results_df["pvals"] > pval_neg]
     print(f"DE negatives candidate pool: {len(non_degs_candidates)}")
 
-    def sample_group(group, n_samples):
-        n = min(n_samples, len(group))
-        return group.sample(n=n, random_state=seed) if n > 0 else None
-
-    non_degs_df = non_degs_candidates.groupby("pert", group_keys=False).apply(sample_group, n_samples=n_neg)
+    non_degs_df = _sample_n_per_pert(non_degs_candidates, n=n_neg, seed=seed)
 
     if non_degs_df is not None and not non_degs_df.empty:
         non_degs_df["label"] = 0
@@ -204,14 +229,10 @@ def process_cell_line(
     if split_mode == "k_perturbation_fixed_genes":
         m = int(m_genes_per_perturbation)
         train_rows = final_labels_df[final_labels_df["pert"].isin(train_set)]
-        sampled_train_rows = (
-            train_rows.groupby("pert", group_keys=False)
-            .apply(lambda g: g.sample(n=min(m, len(g)), random_state=seed))
-            .copy()
-        )
+        sampled_train_rows = _sample_n_per_pert(train_rows, n=m, seed=seed)
 
         sampled_train_rows["split"] = "train"
-        test_rows = final_labels_df[~final_labels_df["pert"].isin(train_set)].copy()
+        test_rows = final_labels_df[final_labels_df["pert"].isin(test_set)].copy()
         test_rows["split"] = "test"
         final_labels_df = pd.concat([sampled_train_rows, test_rows], ignore_index=True)
 
@@ -221,11 +242,18 @@ def process_cell_line(
             f"realized train tuples = {realized_train_n}"
         )
 
+    final_labels_df = final_labels_df[final_labels_df["split"].isin(["train", "test"])].copy()
     final_labels_df = final_labels_df[["pert", "gene", "label", "split"]]
     _print_split_stats(final_labels_df, "DE")
 
     os.makedirs(output_dir, exist_ok=True)
-    de_output = os.path.join(output_dir, f"{cell_line_name}_DE.csv")
+    tag = f"_{output_tag}" if output_tag else ""
+    de_output = os.path.join(output_dir, f"{cell_line_name}{tag}_DE.csv")
+    if os.path.exists(de_output) and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {de_output}. "
+            "Use --output-tag to create a unique file name or pass --overwrite to replace."
+        )
     final_labels_df.to_csv(de_output, index=False)
     print(f"Saved DE CSV: {de_output}")
 
@@ -237,13 +265,9 @@ def process_cell_line(
     if split_mode == "k_perturbation_fixed_genes":
         m = int(m_genes_per_perturbation)
         dir_train_rows = dir_labels_df[dir_labels_df["pert"].isin(train_set)]
-        sampled_dir_train_rows = (
-            dir_train_rows.groupby("pert", group_keys=False)
-            .apply(lambda g: g.sample(n=min(m, len(g)), random_state=seed))
-            .copy()
-        )
+        sampled_dir_train_rows = _sample_n_per_pert(dir_train_rows, n=m, seed=seed)
         sampled_dir_train_rows["split"] = "train"
-        dir_test_rows = dir_labels_df[~dir_labels_df["pert"].isin(train_set)].copy()
+        dir_test_rows = dir_labels_df[dir_labels_df["pert"].isin(test_set)].copy()
         dir_test_rows["split"] = "test"
         dir_labels_df = pd.concat([sampled_dir_train_rows, dir_test_rows], ignore_index=True)
 
@@ -253,9 +277,15 @@ def process_cell_line(
             f"realized train tuples = {realized_dir_train_n}"
         )
 
+    dir_labels_df = dir_labels_df[dir_labels_df["split"].isin(["train", "test"])].copy()
     _print_split_stats(dir_labels_df, "DIR")
 
-    dir_output = os.path.join(output_dir, f"{cell_line_name}_DIR.csv")
+    dir_output = os.path.join(output_dir, f"{cell_line_name}{tag}_DIR.csv")
+    if os.path.exists(dir_output) and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {dir_output}. "
+            "Use --output-tag to create a unique file name or pass --overwrite to replace."
+        )
     dir_labels_df.to_csv(dir_output, index=False)
     print(f"Saved DIR CSV: {dir_output}")
 

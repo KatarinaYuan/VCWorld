@@ -46,6 +46,16 @@ def _add_prepare_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Seed for selecting fixed test perturbations (defaults to --seed when omitted).",
     )
+    p.add_argument(
+        "--output-tag",
+        default=None,
+        help="Optional suffix tag for output files, e.g. k20_m50 -> C32_k20_m50_DE.csv",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output CSV files if they already exist.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fdr", type=float, default=0.05)
     p.add_argument("--lfc", type=float, default=0.25)
@@ -200,6 +210,8 @@ def main(argv: list[str]) -> int:
             m_genes_per_perturbation=args.m_genes_per_perturbation,
             fixed_test_fraction=args.fixed_test_fraction,
             fixed_test_seed=args.fixed_test_seed,
+            output_tag=args.output_tag,
+            overwrite=args.overwrite,
             seed=args.seed,
             fdr=args.fdr,
             lfc=args.lfc,
