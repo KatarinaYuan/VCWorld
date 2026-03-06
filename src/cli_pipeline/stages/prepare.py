@@ -153,8 +153,10 @@ def process_cell_line(
                 "split_mode=k_perturbation_fixed_genes requires "
                 "--k-support-perturbations and --m-genes-per-perturbation."
             )
-        if k_support_perturbations <= 0 or m_genes_per_perturbation <= 0:
-            raise ValueError("k_support_perturbations and m_genes_per_perturbation must be > 0.")
+        if k_support_perturbations < 0 or m_genes_per_perturbation <= 0:
+            raise ValueError(
+                "k_support_perturbations must be >= 0 and m_genes_per_perturbation must be > 0."
+            )
         if fixed_test_fraction is not None:
             if not 0.0 < fixed_test_fraction < 1.0:
                 raise ValueError("fixed_test_fraction must be in (0, 1).")
@@ -185,10 +187,14 @@ def process_cell_line(
                 f"fraction={fixed_test_fraction}, test_seed={test_rng_seed}, "
                 f"test_perts={len(test_set)}, support_pool={len(support_pool)}, unused_perts={len(unused_set)}"
             )
+            if k_support_perturbations == 0:
+                print("Zero-shot mode enabled: no support perturbations selected for training.")
         else:
             k = min(k_support_perturbations, len(perturbations_shuffled))
             train_set = set(perturbations_shuffled[:k])
             test_set = set(perturbations_shuffled[k:])
+            if k == 0:
+                print("Zero-shot mode enabled: no support perturbations selected for training.")
     else:
         raise ValueError(f"Unknown split_mode: {split_mode}")
 
