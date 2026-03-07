@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -102,6 +104,51 @@ def _extract_pred_label(task: str, query_text: str) -> str:
     if "insufficient evidence" in focus:
         return "insufficient"
     return "insufficient"
+
+
+def _extract_label_ranking_score_map(query_text: str) -> Dict[str, float]:
+    m = re.search(r"\[label_ranking_scores\]\s*(\{.*?\})", query_text, re.DOTALL)
+    if not m:
+        return {}
+    payload = m.group(1).strip()
+    try:
+        obj = ast.literal_eval(payload)
+    except (ValueError, SyntaxError):
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in obj.items():
+        key = str(k).strip().lower()
+        try:
+            out[key] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _softmax_prob(score_map: Dict[str, float], positive_label: str) -> Optional[float]:
+    if not score_map or positive_label not in score_map:
+        return None
+    vals = list(score_map.values())
+    max_v = max(vals)
+    exps = {k: math.exp(v - max_v) for k, v in score_map.items()}
+    z = sum(exps.values())
+    if z <= 0:
+        return None
+    return exps[positive_label] / z
+
+
+def _extract_pred_score(task: str, query_text: str, pred_binary: Optional[int]) -> Optional[float]:
+    score_map = _extract_label_ranking_score_map(query_text)
+    positive_label = "yes" if task == "de" else "increase"
+    score_prob = _softmax_prob(score_map, positive_label)
+    if score_prob is not None:
+        return float(score_prob)
+    if pred_binary is None:
+        return None
+    # Fallback for generation outputs without ranking scores.
+    return float(pred_binary)
 
 
 def _parse_predictions(task: str, predictions_file: Path) -> Dict[int, dict]:
@@ -301,6 +348,7 @@ def evaluate(
                 "true_label": true_label,
                 "pred_label": pred_label,
                 "pred_binary": pred_binary,
+                "pred_score": _extract_pred_score(task, pred["query_block"] if pred else "", pred_binary),
                 "answered": pred_binary is not None,
                 "match": (pred_binary == true_label) if (pred_binary is not None and true_label is not None) else None,
             }
@@ -321,13 +369,8 @@ def evaluate(
     if answered > 0:
         y_true = [int(r["true_label"]) for r in answered_rows]
         y_pred = [int(r["pred_binary"]) for r in answered_rows]
-        y_score = y_pred  # hard-label score for AUROC/AUPRC
+        y_score = [float(r["pred_score"]) if r["pred_score"] is not None else float(r["pred_binary"]) for r in answered_rows]
         metrics = _binary_metrics(y_true, y_pred, y_score)
-        import numpy as np
-        with open("wrong_prediction.tmp", "w") as fout:
-            idx = (np.array(y_pred)!=np.array(y_true)).nonzero()
-            for x in idx[0]:
-                fout.write(pred_by_id[int(x) + 1]["query_block"] + "\n\n")
 
     else:
         metrics = {
@@ -374,6 +417,7 @@ def evaluate(
         "true_label",
         "pred_label",
         "pred_binary",
+        "pred_score",
         "answered",
         "match",
     ]
