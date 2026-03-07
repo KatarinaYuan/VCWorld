@@ -3,7 +3,6 @@
 #SBATCH --partition=TrixieMain
 #SBATCH --account=ai4d-core-132
 #SBATCH --exclude=trixie-cn109
-#SBATCH --exclude=trixie-cn130
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
