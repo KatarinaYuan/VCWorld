@@ -55,6 +55,8 @@ def get_description(name: str, desc_map: Dict[str, str], label: str) -> str:
 
 def format_observations(pairs: List[List[str]], drug_desc: Dict[str, str], gene_desc: Dict[str, str],
                         choices: Optional[List[str]], max_examples: int = 10) -> str:
+    if max_examples <= 0:
+        return "No similar experimental observations available for context."
     if not pairs:
         return "No similar experimental observations available for context."
 
@@ -106,7 +108,9 @@ def generate_prompts(*, task: str, retrieval_json: str, drug_desc_json: str, gen
                      template_file: Optional[str], output_file: str,
                      cell_line_idx: Optional[int] = None, max_cases: Optional[int] = None,
                      seed: int = 42, include_gold_label: bool = False,
-                     labels_csv: Optional[str] = None) -> None:
+                     labels_csv: Optional[str] = None,
+                     max_observation_examples: int = 10,
+                     disable_observation_results: bool = False) -> None:
     random.seed(seed)
 
     retrieval = load_json(retrieval_json)
@@ -155,7 +159,14 @@ def generate_prompts(*, task: str, retrieval_json: str, drug_desc_json: str, gen
                 idx = cell_line_idx
             cell_short, cell_desc = cell_lines[idx]
 
-            obs = format_observations(retrieved_pairs, drug_desc, gene_desc, choices)
+            obs_choices = None if disable_observation_results else choices
+            obs = format_observations(
+                retrieved_pairs,
+                drug_desc,
+                gene_desc,
+                obs_choices,
+                max_examples=max_observation_examples,
+            )
 
             filled = prompt_template.format(
                 pert=drug,

@@ -87,6 +87,10 @@ def _add_prompt_args(p: argparse.ArgumentParser) -> None:
                    help="Inject gold label into [Start of Output] block (for training prompts).")
     p.add_argument("--labels-csv", default=None,
                    help="Optional CSV with pert/gene/label for fallback label lookup in prompt stage.")
+    p.add_argument("--max-observation-examples", type=int, default=10,
+                   help="Max retrieved observation examples inserted into prompt input (0 disables examples).")
+    p.add_argument("--disable-observation-results", action="store_true",
+                   help="Do not include synthetic random 'Result' lines in observation examples.")
 
 
 def _add_infer_args(p: argparse.ArgumentParser) -> None:
@@ -246,6 +250,8 @@ def main(argv: list[str]) -> int:
             seed=args.seed,
             include_gold_label=args.include_gold_label,
             labels_csv=args.labels_csv,
+            max_observation_examples=args.max_observation_examples,
+            disable_observation_results=args.disable_observation_results,
         )
         return 0
 

@@ -20,6 +20,7 @@ class PromptRecord:
     gene: Optional[str]
     system_prompt: Optional[str]
     user_input: Optional[str]
+    output_text: Optional[str]
 
 
 def split_prompt_blocks(text: str) -> List[str]:
@@ -36,8 +37,10 @@ def parse_prompt_block(block_text: str) -> PromptRecord:
 
     system_match = re.search(r"\[Start of Prompt\](.*?)\[End of Prompt\]", block_text, re.DOTALL)
     user_match = re.search(r"\[Start of Input\](.*?)\[End of Input\]", block_text, re.DOTALL)
+    output_match = re.search(r"\[Start of Output\](.*?)\[End of Output\]", block_text, re.DOTALL)
     system_prompt = system_match.group(1).strip() if system_match else None
     user_input = user_match.group(1).strip() if user_match else None
+    output_text = output_match.group(1).strip() if output_match else None
 
     return PromptRecord(
         idx=-1,
@@ -46,6 +49,7 @@ def parse_prompt_block(block_text: str) -> PromptRecord:
         gene=gene,
         system_prompt=system_prompt,
         user_input=user_input,
+        output_text=output_text,
     )
 
 
@@ -88,4 +92,3 @@ def format_prediction_block(header: str, response: str) -> str:
         f"--- End of Query for {header} ---\n\n"
         f"{PROMPT_SEPARATOR}\n\n"
     )
-

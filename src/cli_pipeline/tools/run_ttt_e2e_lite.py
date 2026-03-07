@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -90,23 +90,94 @@ def _init_wandb(args):
     return run, wandb
 
 
-def _build_train_sequences(args, tokenizer) -> List[List[int]]:
+def _to_token_ids(x) -> List[int]:
+    if isinstance(x, list):
+        if x and isinstance(x[0], list):
+            return list(x[0])
+        return list(x)
+    return list(x)
+
+
+def _build_supervised_sequence(
+    tokenizer,
+    system_prompt: str,
+    user_input: str,
+    output_text: str,
+    max_seq_len: int,
+) -> Optional[Tuple[List[int], List[int]]]:
+    prefix_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input},
+    ]
+    full_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input},
+        {"role": "assistant", "content": output_text},
+    ]
+
+    prefix_ids_all = _to_token_ids(
+        tokenizer.apply_chat_template(prefix_messages, add_generation_prompt=True, tokenize=True)
+    )
+    full_ids_all = _to_token_ids(
+        tokenizer.apply_chat_template(full_messages, add_generation_prompt=False, tokenize=True)
+    )
+    if len(full_ids_all) < 2:
+        return None
+
+    # Supervise only assistant answer tokens.
+    ans_start_all = len(prefix_ids_all)
+    if ans_start_all >= len(full_ids_all):
+        return None
+
+    if max_seq_len > 0 and len(full_ids_all) > max_seq_len:
+        cut = len(full_ids_all) - max_seq_len
+        full_ids = full_ids_all[cut:]
+        ans_start = max(0, ans_start_all - cut)
+    else:
+        full_ids = full_ids_all
+        ans_start = ans_start_all
+
+    if ans_start >= len(full_ids):
+        return None
+
+    labels = [-100] * len(full_ids)
+    for i in range(ans_start, len(full_ids)):
+        labels[i] = full_ids[i]
+    return full_ids, labels
+
+
+def _build_train_sequences(args, tokenizer) -> List[Tuple[List[int], List[int]]]:
     labels = load_label_map(args.labels_csv)
     records = load_prompts(args.prompts_file)
-    seqs: List[List[int]] = []
+    seqs: List[Tuple[List[int], List[int]]] = []
     for rec in records:
-        if not rec.pert or not rec.gene or not rec.system_prompt or not rec.user_input:
+        if (
+            not rec.pert
+            or not rec.gene
+            or not rec.system_prompt
+            or not rec.user_input
+            or not rec.output_text
+        ):
             continue
         row = labels.get((rec.pert, rec.gene))
         if row is None or row.get("split", "").strip().lower() != "train":
             continue
-        txt = render_chat_prompt(tokenizer, rec.system_prompt, rec.user_input)
-        ids = tokenizer(txt, add_special_tokens=False).input_ids
+        seq = _build_supervised_sequence(
+            tokenizer=tokenizer,
+            system_prompt=rec.system_prompt,
+            user_input=rec.user_input,
+            output_text=rec.output_text,
+            max_seq_len=args.max_seq_len,
+        )
+        if seq is None:
+            continue
+        ids, label_ids = seq
         if len(ids) < 32:
             continue
-        if args.max_seq_len > 0:
-            ids = ids[:args.max_seq_len]
-        seqs.append(ids)
+        # Need at least one supervised token after causal shift.
+        if not any(x != -100 for x in label_ids[1:]):
+            continue
+        seqs.append((ids, label_ids))
     return seqs
 
 
@@ -261,6 +332,8 @@ def run(args) -> None:
 
     print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
+    import ipdb
+    ipdb.set_trace()
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
     print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")
@@ -279,28 +352,39 @@ def run(args) -> None:
         print(f"[TTT-E2E-lite] ---- Epoch {epoch}/{args.num_epochs} start ----")
         total_outer = 0.0
         n_effective = 0
-        for i, ids in enumerate(seqs, 1):
+        for i, (ids, label_ids) in enumerate(seqs, 1):
             # Chunked scan over a single sequence (no support/query split).
             chunk_tokens = max(2, args.chunk_tokens)
-            chunks = [ids[j:j + chunk_tokens] for j in range(0, len(ids), chunk_tokens)]
-            chunks = [c for c in chunks if len(c) >= 2]
+            chunks = [
+                (ids[j:j + chunk_tokens], label_ids[j:j + chunk_tokens])
+                for j in range(0, len(ids), chunk_tokens)
+            ]
+            chunks = [c for c in chunks if len(c[0]) >= 2 and any(x != -100 for x in c[1][1:])]
             if not chunks:
                 continue
 
-            chunk_tensors = [torch.tensor([c], dtype=torch.long, device=device) for c in chunks]
+            chunk_tensors = [
+                (
+                    torch.tensor([tok_chunk], dtype=torch.long, device=device),
+                    torch.tensor([lbl_chunk], dtype=torch.long, device=device),
+                )
+                for tok_chunk, lbl_chunk in chunks
+            ]
 
             # Save initial trainable params before inner updates.
             init_snap = _snapshot_params(named_params)
 
             # Inner loop: scan over chunks and update on each chunk.
-            for chunk_t in chunk_tensors:
+            inner_loss = None
+            for chunk_t, chunk_labels_t in chunk_tensors:
                 if args.inner_max_tokens > 0 and chunk_t.shape[1] > args.inner_max_tokens:
                     chunk_t = chunk_t[:, -args.inner_max_tokens:]
+                    chunk_labels_t = chunk_labels_t[:, -args.inner_max_tokens:]
                 for _ in range(args.inner_steps):
                     inner_out = model(
                         input_ids=chunk_t,
                         attention_mask=torch.ones_like(chunk_t),
-                        labels=chunk_t,
+                        labels=chunk_labels_t,
                     )
                     inner_loss = inner_out.loss
                     inner_loss.backward()
@@ -309,11 +393,11 @@ def run(args) -> None:
 
             # Outer loss: mean over all chunks on adapted model.
             outer_losses = []
-            for chunk_t in chunk_tensors:
+            for chunk_t, chunk_labels_t in chunk_tensors:
                 out = model(
                     input_ids=chunk_t,
                     attention_mask=torch.ones_like(chunk_t),
-                    labels=chunk_t,
+                    labels=chunk_labels_t,
                 )
                 outer_losses.append(out.loss)
             outer_loss = torch.stack(outer_losses).mean()
@@ -350,7 +434,7 @@ def run(args) -> None:
             if i % args.log_every == 0:
                 avg_outer = total_outer / max(1, i)
                 cur_outer = float(outer_loss.detach().cpu())
-                cur_inner = float(inner_loss.detach().cpu())
+                cur_inner = float(inner_loss.detach().cpu()) if inner_loss is not None else float("nan")
                 print(
                     f"[TTT-E2E-lite] epoch={epoch} step={i}/{len(seqs)} chunks={len(chunks)} "
                     f"outer_loss={cur_outer:.4f} avg_outer_loss={avg_outer:.4f} inner_loss={cur_inner:.4f}"
