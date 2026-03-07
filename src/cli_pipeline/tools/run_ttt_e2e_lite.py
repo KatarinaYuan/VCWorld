@@ -332,8 +332,6 @@ def run(args) -> None:
 
     print("[TTT-E2E-lite] Loading train sequences")
     seqs = _build_train_sequences(args, tokenizer)
-    import ipdb
-    ipdb.set_trace()
     if not seqs:
         raise RuntimeError("No train sequences available for TTT-E2E-lite.")
     print(f"[TTT-E2E-lite] Train sequences: {len(seqs)}")

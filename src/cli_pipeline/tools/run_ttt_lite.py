@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Dict, List, Tuple
 
@@ -13,6 +14,10 @@ import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ggmv_core import GGMVParams, forward_ggmv
+from ggmv_graph import load_ggmv_graph
+from ggmv_llm import LLMMechanismScorer
+from ggmv_support import build_query_from_record, build_support_pool_from_labels, select_support_set_for_query
 from ttt_common import format_prediction_block, load_label_map, load_prompts, render_chat_prompt
 
 # kernprof injects `profile` into builtins; provide a no-op fallback for normal runs.
@@ -111,6 +116,60 @@ def _score_label_candidates(
     return scores
 
 
+def _load_ggmv_params(args) -> GGMVParams:
+    params = GGMVParams(
+        top_k_modules=args.ggmv_top_k_modules,
+        posterior_mode=args.ggmv_posterior_mode,
+        w0=args.ggmv_w0,
+        w1=args.ggmv_w1,
+        w2=args.ggmv_w2,
+        beta=args.ggmv_beta,
+        gamma_mech=args.ggmv_gamma_mech,
+        lambda_v=args.ggmv_lambda_v,
+        gamma_a=args.ggmv_gamma_a,
+        eta1=args.ggmv_eta1,
+        eta2=args.ggmv_eta2,
+        eta3=args.ggmv_eta3,
+        eta4=args.ggmv_eta4,
+        b0=args.ggmv_b0,
+        b1=args.ggmv_b1,
+        no_graph_prior=args.ggmv_no_graph_prior,
+        no_support_utility=args.ggmv_no_support_utility,
+        no_llm_mech=args.ggmv_no_llm_mech,
+        no_verification=args.ggmv_no_verification,
+        no_sufficiency=args.ggmv_no_sufficiency,
+    )
+    if not args.ggmv_params_json:
+        return params
+
+    with open(args.ggmv_params_json, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    for key, value in payload.items():
+        if hasattr(params, key):
+            setattr(params, key, value)
+    return params
+
+
+def _extract_base_score_map(label_candidates: List[str], scores: List[float]) -> Dict[str, float]:
+    out = {k.strip().lower(): float(v) for k, v in zip(label_candidates, scores)}
+    out.setdefault("yes", float("-inf"))
+    out.setdefault("no", float("-inf"))
+    out.setdefault("insufficient", float("-inf"))
+    return out
+
+
+def _format_debug_modules(module_pairs: List[Tuple[int, float]], graph, top_n: int = 6) -> List[dict]:
+    out = []
+    for module_id, score in module_pairs[:top_n]:
+        if module_id >= 0 and module_id < len(graph.idx_to_module):
+            name = graph.idx_to_module[module_id]
+        else:
+            name = f"module_{module_id}"
+        out.append({"module_id": int(module_id), "module_name": name, "score": float(score)})
+    return out
+
+
 @profile
 def run(args) -> None:
     print("[TTT-lite] ===== Run Config =====")
@@ -128,7 +187,7 @@ def run(args) -> None:
     records = load_prompts(args.prompts_file)
     print(f"[TTT-lite] Loaded prompt records: {len(records)} | label rows: {len(labels)}")
 
-    test_records = []
+    test_items = []
     for rec in records:
         if not rec.pert or not rec.gene or not rec.system_prompt or not rec.user_input:
             continue
@@ -136,11 +195,11 @@ def run(args) -> None:
         if row is None:
             continue
         if row.get("split", "").strip().lower() == "test":
-            test_records.append(rec)
+            test_items.append((rec, row))
 
-    if not test_records:
+    if not test_items:
         raise RuntimeError("No test records found from prompts + labels split.")
-    print(f"[TTT-lite] Test records to run: {len(test_records)}")
+    print(f"[TTT-lite] Test records to run: {len(test_items)}")
 
     named_params = _trainable_named_params(model)
     print(f"[TTT-lite] Trainable params for inner update: {len(named_params)} tensors")
@@ -157,9 +216,56 @@ def run(args) -> None:
         tokenizer(" " + cand if not cand.startswith(" ") else cand, add_special_tokens=False).input_ids
         for cand in label_candidates
     ]
-    if args.prediction_mode == "label-ranking":
+    if args.prediction_mode in {"label-ranking", "graph-mechanism-verification"}:
         print(f"[TTT-lite] label-ranking candidates: {label_candidates}")
-    for i, rec in enumerate(test_records, 1):
+
+    ggmv_graph = None
+    ggmv_support_pool = None
+    ggmv_params = None
+    ggmv_mech_scorer = None
+    if args.prediction_mode == "graph-mechanism-verification":
+        if not args.kg_dir:
+            raise RuntimeError("--kg-dir is required when --prediction-mode graph-mechanism-verification")
+        required_labels = {"yes", "no", "insufficient"}
+        if not required_labels.issubset({x.strip().lower() for x in label_candidates}):
+            raise RuntimeError(
+                "graph-mechanism-verification requires --label-candidates containing yes,no,insufficient"
+            )
+
+        print(f"[TTT-lite][GGMV] Loading KG from {args.kg_dir}")
+        ggmv_graph = load_ggmv_graph(
+            kg_dir=args.kg_dir,
+            alpha=args.ggmv_alpha,
+            nodes_file=args.kg_nodes_file,
+            edges_file=args.kg_edges_file,
+            graph_file=args.kg_graph_file,
+            strict=False,
+        )
+        ggmv_params = _load_ggmv_params(args)
+        print(f"[TTT-lite][GGMV] Params: {ggmv_params}")
+
+        ggmv_support_pool = build_support_pool_from_labels(
+            labels_csv=args.labels_csv,
+            graph=ggmv_graph,
+            split=args.ggmv_support_split,
+            default_cell_id=args.ggmv_default_cell_id,
+            max_genes_per_perturbation=args.ggmv_max_genes_per_support,
+        )
+        print(f"[TTT-lite][GGMV] Support pool perturbations: {len(ggmv_support_pool)}")
+
+        if args.ggmv_use_llm_mech and not args.ggmv_no_llm_mech:
+            ggmv_mech_scorer = LLMMechanismScorer(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_tokens=args.ggmv_llm_max_tokens,
+                module_top_genes=args.ggmv_module_top_genes,
+            )
+            print("[TTT-lite][GGMV] LLM mechanism scorer: enabled")
+        else:
+            print("[TTT-lite][GGMV] LLM mechanism scorer: disabled")
+
+    for i, (rec, label_row) in enumerate(test_items, 1):
         header = f"Prompt {rec.prompt_id}" if rec.prompt_id is not None else f"Prompt_{rec.idx}"
         prompt_text = render_chat_prompt(tokenizer, rec.system_prompt, rec.user_input)
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
@@ -179,7 +285,7 @@ def run(args) -> None:
                 optimizer.zero_grad(set_to_none=True)
 
             model.eval()
-            if args.prediction_mode == "label-ranking":
+            if args.prediction_mode in {"label-ranking", "graph-mechanism-verification"}:
                 scores = _score_label_candidates(
                     model=model,
                     device=device,
@@ -187,13 +293,103 @@ def run(args) -> None:
                     prefix_ids=label_prefix_ids,
                     candidate_id_lists=candidate_id_lists,
                 )
-                best_idx = max(range(len(scores)), key=lambda k: scores[k])
-                best_label = label_candidates[best_idx]
-                response = (
-                    "Final Deterministic Prediction:\n"
-                    f"{best_label}\n"
-                    f"[label_ranking_scores] {dict(zip(label_candidates, [round(s, 4) for s in scores]))}"
-                )
+                if args.prediction_mode == "label-ranking":
+                    best_idx = max(range(len(scores)), key=lambda k: scores[k])
+                    best_label = label_candidates[best_idx]
+                    response = (
+                        "Final Deterministic Prediction:\n"
+                        f"{best_label}\n"
+                        f"[label_ranking_scores] {dict(zip(label_candidates, [round(s, 4) for s in scores]))}"
+                    )
+                else:
+                    if ggmv_graph is None or ggmv_support_pool is None or ggmv_params is None:
+                        raise RuntimeError("GGMV mode not initialized correctly.")
+
+                    base_score_map = _extract_base_score_map(label_candidates, scores)
+                    query = build_query_from_record(
+                        rec=rec,
+                        label_row=label_row,
+                        graph=ggmv_graph,
+                        base_scores=base_score_map,
+                        default_cell_id=args.ggmv_default_cell_id,
+                    )
+                    support_set = select_support_set_for_query(
+                        query=query,
+                        support_pool=ggmv_support_pool,
+                        graph=ggmv_graph,
+                        max_support_perturbations=args.ggmv_max_support_perturbations,
+                        include_same_drug=args.ggmv_include_same_drug,
+                    )
+
+                    if ggmv_mech_scorer is not None:
+                        llm_mech_fn = (
+                            lambda module_ids: ggmv_mech_scorer.score_candidate_modules(
+                                prompt_ids=prompt_ids,
+                                candidate_module_ids=module_ids,
+                                graph=ggmv_graph,
+                            )
+                        )
+                        llm_suff = float(ggmv_mech_scorer.score_sufficiency(prompt_ids=prompt_ids))
+                    else:
+                        llm_mech_fn = None
+                        llm_suff = 0.0
+
+                    out_ggmv = forward_ggmv(
+                        query=query,
+                        support_set=support_set,
+                        graph=ggmv_graph,
+                        params=ggmv_params,
+                        llm_mech_score_fn=llm_mech_fn,
+                        llm_sufficiency_score=llm_suff,
+                    )
+                    calibrated = out_ggmv["scores"]
+                    final_label = max(["yes", "no", "insufficient"], key=lambda x: float(calibrated[x]))
+                    response_lines = [
+                        "Final Deterministic Prediction:",
+                        final_label,
+                        f"[label_ranking_scores] {{'yes': {round(float(calibrated['yes']), 4)}, 'no': {round(float(calibrated['no']), 4)}, 'insufficient': {round(float(calibrated['insufficient']), 4)}}}",  # noqa: E501
+                    ]
+                    if args.ggmv_debug:
+                        debug_payload = {
+                            "query": {
+                                "query_id": query.get("query_id"),
+                                "drug_name": query.get("drug_name"),
+                                "gene_name": query.get("gene_name"),
+                                "drug_id": query.get("drug_id"),
+                                "gene_id": query.get("gene_id"),
+                                "support_size": len(support_set),
+                            },
+                            "candidate_modules_top": _format_debug_modules(
+                                out_ggmv["debug"]["top_prior_modules"], ggmv_graph, top_n=args.ggmv_debug_top_n
+                            ),
+                            "graph_prior_top": _format_debug_modules(
+                                out_ggmv["debug"]["top_prior_modules"], ggmv_graph, top_n=args.ggmv_debug_top_n
+                            ),
+                            "support_evidence_top": _format_debug_modules(
+                                out_ggmv["debug"]["top_support_evidence_modules"], ggmv_graph, top_n=args.ggmv_debug_top_n
+                            ),
+                            "llm_mech_top": _format_debug_modules(
+                                out_ggmv["debug"]["top_llm_mech_modules"], ggmv_graph, top_n=args.ggmv_debug_top_n
+                            ),
+                            "posterior_top": _format_debug_modules(
+                                out_ggmv["debug"]["top_posterior_modules"], ggmv_graph, top_n=args.ggmv_debug_top_n
+                            ),
+                            "verification_score": round(float(out_ggmv["verification_score"]), 6),
+                            "sufficiency_score": round(float(out_ggmv["sufficiency_score"]), 6),
+                            "base_scores": {
+                                "yes": round(float(base_score_map.get("yes", 0.0)), 6),
+                                "no": round(float(base_score_map.get("no", 0.0)), 6),
+                                "insufficient": round(float(base_score_map.get("insufficient", 0.0)), 6),
+                            },
+                            "calibrated_scores": {
+                                "yes": round(float(calibrated["yes"]), 6),
+                                "no": round(float(calibrated["no"]), 6),
+                                "insufficient": round(float(calibrated["insufficient"]), 6),
+                            },
+                            "final_prediction": final_label,
+                        }
+                        response_lines.append(f"[ggmv_debug] {json.dumps(debug_payload, ensure_ascii=True)}")
+                    response = "\n".join(response_lines)
             else:
                 with torch.no_grad():
                     gen = model.generate(
@@ -212,7 +408,7 @@ def run(args) -> None:
         except Exception as e:  # Keep long runs alive even if one sample fails on CUDA/runtime.
             msg = str(e).replace("\t", " ").replace("\n", " ")
             failed_rows.append(f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\t{msg}\n")
-            print(f"[TTT-lite][WARN] failed {i}/{len(test_records)} ({header}): {msg}")
+            print(f"[TTT-lite][WARN] failed {i}/{len(test_items)} ({header}): {msg}")
             fatal_cuda_encountered = _is_fatal_cuda_error(msg)
             if torch.cuda.is_available() and not fatal_cuda_encountered:
                 try:
@@ -233,16 +429,16 @@ def run(args) -> None:
                     failed_rows.append(
                         f"{i}\t{header}\t{rec.idx}\t{rec.prompt_id}\tRESTORE_FAILED: {restore_msg}\n"
                     )
-                    print(f"[TTT-lite][WARN] restore failed at {i}/{len(test_records)} ({header}): {restore_msg}")
+                    print(f"[TTT-lite][WARN] restore failed at {i}/{len(test_items)} ({header}): {restore_msg}")
                     fatal_cuda_encountered = True
 
         if fatal_cuda_encountered:
             print("[TTT-lite][ERROR] Fatal CUDA state detected; stopping this run early. Please relaunch to continue.")
             break
 
-        if i % 10 == 0 or i == len(test_records):
+        if i % 10 == 0 or i == len(test_items):
             loss_val = float(loss.detach().cpu()) if loss is not None else float("nan")
-            print(f"[TTT-lite] done {i}/{len(test_records)} | last_inner_loss={loss_val:.4f}")
+            print(f"[TTT-lite] done {i}/{len(test_items)} | last_inner_loss={loss_val:.4f}")
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.writelines(out_blocks)
@@ -271,9 +467,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument(
         "--prediction-mode",
-        choices=["generate", "label-ranking"],
+        choices=["generate", "label-ranking", "graph-mechanism-verification"],
         default="generate",
-        help="`generate` uses HF generation; `label-ranking` scores labels directly.",
+        help=(
+            "`generate` uses HF generation; `label-ranking` scores labels directly; "
+            "`graph-mechanism-verification` applies GGMV calibration over base label ranking."
+        ),
     )
     p.add_argument(
         "--label-candidates",
@@ -293,6 +492,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-target-modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     p.add_argument("--line-profile", action="store_true", help="Enable line_profiler for run().")
     p.add_argument("--line-profile-out", default=None, help="Optional output file for line_profiler stats.")
+
+    # GGMV options (active only when --prediction-mode graph-mechanism-verification).
+    p.add_argument("--kg-dir", default=None, help="KG directory containing nodes/edges/graph JSON files.")
+    p.add_argument("--kg-nodes-file", default="nodes.json")
+    p.add_argument("--kg-edges-file", default="edges.json")
+    p.add_argument("--kg-graph-file", default="graph.json")
+    p.add_argument("--ggmv-params-json", default=None, help="Optional JSON file to override GGMV scalar params.")
+    p.add_argument("--ggmv-alpha", type=float, default=0.1, help="Alpha for R_tilde graph diffusion.")
+    p.add_argument("--ggmv-top-k-modules", type=int, default=64)
+    p.add_argument("--ggmv-posterior-mode", choices=["sparsemax", "softmax"], default="sparsemax")
+    p.add_argument("--ggmv-support-split", default="train", help="Which split to use as support pool from labels CSV.")
+    p.add_argument("--ggmv-default-cell-id", type=int, default=0)
+    p.add_argument("--ggmv-max-support-perturbations", type=int, default=32)
+    p.add_argument("--ggmv-max-genes-per-support", type=int, default=256)
+    p.add_argument("--ggmv-include-same-drug", action="store_true", help="Allow same-drug supports in support set.")
+    p.add_argument("--ggmv-use-llm-mech", action="store_true", help="Enable hidden-state LLM mechanism scorer.")
+    p.add_argument("--ggmv-llm-max-tokens", type=int, default=1024)
+    p.add_argument("--ggmv-module-top-genes", type=int, default=8)
+    p.add_argument("--ggmv-debug", action="store_true", help="Append GGMV debug JSON payload into each output block.")
+    p.add_argument("--ggmv-debug-top-n", type=int, default=6)
+
+    # GGMV scalar defaults (kept explicit for ablation friendliness).
+    p.add_argument("--ggmv-w0", type=float, default=0.0)
+    p.add_argument("--ggmv-w1", type=float, default=1.0)
+    p.add_argument("--ggmv-w2", type=float, default=1.0)
+    p.add_argument("--ggmv-beta", type=float, default=1.0)
+    p.add_argument("--ggmv-gamma-mech", type=float, default=1.0)
+    p.add_argument("--ggmv-lambda-v", type=float, default=1.0)
+    p.add_argument("--ggmv-gamma-a", type=float, default=0.1)
+    p.add_argument("--ggmv-eta1", type=float, default=1.0)
+    p.add_argument("--ggmv-eta2", type=float, default=1.0)
+    p.add_argument("--ggmv-eta3", type=float, default=1.0)
+    p.add_argument("--ggmv-eta4", type=float, default=0.0)
+    p.add_argument("--ggmv-b0", type=float, default=0.0)
+    p.add_argument("--ggmv-b1", type=float, default=1.0)
+
+    # Ablation switches.
+    p.add_argument("--ggmv-no-graph-prior", action="store_true")
+    p.add_argument("--ggmv-no-support-utility", action="store_true")
+    p.add_argument("--ggmv-no-llm-mech", action="store_true")
+    p.add_argument("--ggmv-no-verification", action="store_true")
+    p.add_argument("--ggmv-no-sufficiency", action="store_true")
     return p
 
 
