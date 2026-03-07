@@ -185,6 +185,9 @@ def run(args) -> None:
     if graph.num_modules <= 0:
         raise RuntimeError("No modules parsed from KG")
 
+    import ipdb
+    ipdb.set_trace()
+
     print("[MSLD] Loading support/train examples")
     support_examples = load_msld_examples(
         prompts_file=args.prompts_file,
@@ -197,11 +200,13 @@ def run(args) -> None:
     if not support_examples:
         raise RuntimeError("No support examples found")
     print(f"[MSLD] Support examples: {len(support_examples)}")
+    ipdb.set_trace()
 
     model, tokenizer = _build_model_and_tokenizer(args)
     model_device = next(model.parameters()).device
     head_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[MSLD] Base model device={model_device} | head device={head_device}")
+    ipdb.set_trace()
 
     label_candidates = [x.strip() for x in args.label_candidates.split(",") if x.strip()]
     if not {"yes", "no", "insufficient"}.issubset({x.lower() for x in label_candidates}):
@@ -216,6 +221,7 @@ def run(args) -> None:
         label_candidates=label_candidates,
         label_prefix=args.label_prefix,
     )
+    ipdb.set_trace()
 
     h_np = feat["hidden"]
     y_np = feat["label"]
@@ -234,6 +240,7 @@ def run(args) -> None:
     )
     num_groups = len(group_keys)
     print(f"[MSLD] Support perturbation groups: {num_groups}")
+    ipdb.set_trace()
 
     group_drug_ids = np.zeros((num_groups,), dtype=np.int64)
     group_priors: List[np.ndarray] = []
@@ -273,6 +280,8 @@ def run(args) -> None:
     best_loss = float("inf")
     best_state = None
 
+    ipdb.set_trace()
+
     print("[MSLD] Training heads on support-only adaptation")
     for epoch in range(1, args.epochs + 1):
         heads.train()
@@ -294,6 +303,7 @@ def run(args) -> None:
                 )
                 group_targets.append(z_star)
             z_star_group_t = torch.tensor(np.asarray(group_targets, dtype=np.float32), device=head_device)
+            ipdb.set_trace()
 
         np.random.shuffle(indices)
         total_loss = 0.0
@@ -334,6 +344,7 @@ def run(args) -> None:
             else:
                 l_prop = torch.zeros((), device=head_device)
 
+            ipdb.set_trace()
             loss = (
                 l_label
                 + args.lambda_mech * l_mech
