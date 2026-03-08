@@ -34,7 +34,7 @@ MODEL_PATH="/projects/AI4D/core-132/PerturbReason_ckpt/Meta-Llama-3.2-3B-Instruc
 SHARD_ROOT="/projects/AI4D/core-132/PerturbReason_data/C32_k0_m50_DE_shards_32"
 PROMPTS_SHARD="${SHARD_ROOT}/prompts_${tag}.txt"
 TRUTH_CSV="/projects/AI4D/core-132/PerturbReason_data/C32_k0_m50_DE.csv"
-MSLD_CKPT="/projects/AI4D/core-132/PerturbReason_data/C32_k0_m50_DE_msld_phi_star.pt"
+MSLD_CKPT="/projects/AI4D/core-132/PerturbReason_data/C32_k10_m50_DE_llama3b_graphveri_predictions_.txt"
 OUT_SHARD="${SHARD_ROOT}/msld_llama3b_k0_m50_predictions_${tag}.txt"
 
 # Wait for GPU free memory to avoid startup race with stale processes/cache release.
