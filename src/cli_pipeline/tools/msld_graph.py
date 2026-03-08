@@ -98,10 +98,37 @@ def _row_normalize(adj: sp.csr_matrix) -> sp.csr_matrix:
     return sp.diags(inv, offsets=0, format="csr").dot(adj).tocsr()
 
 
-def _build_r_tilde(r: sp.csr_matrix, p: sp.csr_matrix, alpha: float) -> sp.csr_matrix:
+def _build_r_tilde(
+    r: sp.csr_matrix,
+    p: sp.csr_matrix,
+    alpha: float,
+    diffusion_hops: int = 1,
+    diffusion_decay: float = 1.0,
+) -> sp.csr_matrix:
     if r.shape[0] != p.shape[0]:
         raise ValueError(f"R/P shape mismatch: R rows={r.shape[0]} P rows={p.shape[0]}")
-    return ((1.0 - alpha) * r + alpha * (p.dot(r))).tocsr().astype(np.float32)
+    if r.shape[1] == 0:
+        return sp.csr_matrix(r.shape, dtype=np.float32)
+
+    a = float(min(max(alpha, 0.0), 1.0))
+    hops = int(max(1, diffusion_hops))
+    decay = float(max(0.0, diffusion_decay))
+
+    hop_weights = np.power(decay, np.arange(hops, dtype=np.float32)).astype(np.float32)
+    den = float(hop_weights.sum())
+    if den <= 0.0:
+        hop_weights = np.ones((hops,), dtype=np.float32) / float(hops)
+    else:
+        hop_weights = hop_weights / den
+
+    # Multi-hop diffusion: sum_h w_h * P^h R
+    current = r.tocsr().astype(np.float32)
+    diff_mix = sp.csr_matrix(r.shape, dtype=np.float32)
+    for h in range(hops):
+        current = p.dot(current).tocsr().astype(np.float32)
+        diff_mix = diff_mix + float(hop_weights[h]) * current
+
+    return ((1.0 - a) * r + a * diff_mix).tocsr().astype(np.float32)
 
 
 def sparsemax(logits: np.ndarray) -> np.ndarray:
@@ -187,6 +214,8 @@ def load_msld_graph(
     *,
     kg_dir: str,
     alpha: float = 0.1,
+    diffusion_hops: int = 1,
+    diffusion_decay: float = 1.0,
     max_modules: int = 2048,
     nodes_file: str = "nodes.json",
     edges_file: str = "edges.json",
@@ -395,7 +424,17 @@ def load_msld_graph(
 
     p = sp.csr_matrix((ppi_vals, (ppi_rows, ppi_cols)), shape=(num_genes, num_genes), dtype=np.float32)
     p = _row_normalize(p)
-    r_tilde = _build_r_tilde(r=r, p=p, alpha=alpha) if r.shape[1] > 0 else sp.csr_matrix((num_genes, 0), dtype=np.float32)
+    r_tilde = (
+        _build_r_tilde(
+            r=r,
+            p=p,
+            alpha=alpha,
+            diffusion_hops=diffusion_hops,
+            diffusion_decay=diffusion_decay,
+        )
+        if r.shape[1] > 0
+        else sp.csr_matrix((num_genes, 0), dtype=np.float32)
+    )
 
     # targets: prefer direct target edges, fallback to bridged/weak links
     drug_to_targets: Dict[int, List[int]] = {}
@@ -423,7 +462,8 @@ def load_msld_graph(
 
     print(
         f"[MSLD] Graph loaded: genes={num_genes} drugs={len(idx_to_drug)} modules={r.shape[1]} "
-        f"ppi_edges={len(ppi_vals)//2} gene_module_edges={len(gm_vals)}"
+        f"ppi_edges={len(ppi_vals)//2} gene_module_edges={len(gm_vals)} "
+        f"diffusion_hops={int(max(1, diffusion_hops))} diffusion_decay={float(max(0.0, diffusion_decay)):.4f}"
     )
 
     return MSLDGraph(
@@ -488,10 +528,16 @@ def verify_mechanism_posterior(
     alpha: float,
     beta: float,
     gamma: float,
+    consistency: Optional[np.ndarray] = None,
+    rho: float = 0.0,
     top_k: int = 256,
     eps: float = 1e-8,
 ) -> np.ndarray:
-    """Build graph-verified perturbation mechanism posterior over global vocabulary."""
+    """Build graph-verified perturbation mechanism posterior over global vocabulary.
+
+    logit(m) = alpha*u(m) + beta*log(pi(m)+eps) + gamma*ev(m) + rho*C(m)
+    where consistency term C(m) is optional and defaults to 0.
+    """
     u = np.asarray(proposer_logits, dtype=np.float32).reshape(-1)
     pi = np.asarray(graph_prior, dtype=np.float32).reshape(-1)
     ev = np.asarray(support_evidence, dtype=np.float32).reshape(-1)
@@ -500,6 +546,12 @@ def verify_mechanism_posterior(
     m = u.size
     if m == 0:
         return np.zeros((0,), dtype=np.float32)
+
+    cons = np.zeros((m,), dtype=np.float32)
+    if consistency is not None:
+        cons = np.asarray(consistency, dtype=np.float32).reshape(-1)
+        if cons.size != m:
+            raise ValueError(f"Consistency size mismatch: expected={m} got={cons.size}")
 
     pi = np.maximum(pi, 0.0)
     if float(pi.sum()) <= 0:
@@ -510,7 +562,7 @@ def verify_mechanism_posterior(
     if top_k > 0 and top_k < m:
         part = np.argpartition(pi, -top_k)[-top_k:]
         sel = part[np.argsort(pi[part])[::-1]]
-        logits_sub = alpha * u[sel] + beta * np.log(pi[sel] + eps) + gamma * ev[sel]
+        logits_sub = alpha * u[sel] + beta * np.log(pi[sel] + eps) + gamma * ev[sel] + rho * cons[sel]
         z_sub = sparsemax(logits_sub)
         z = np.zeros((m,), dtype=np.float32)
         z[sel] = z_sub
@@ -519,5 +571,5 @@ def verify_mechanism_posterior(
             z /= den
         return z.astype(np.float32)
 
-    logits = alpha * u + beta * np.log(pi + eps) + gamma * ev
+    logits = alpha * u + beta * np.log(pi + eps) + gamma * ev + rho * cons
     return sparsemax(logits)

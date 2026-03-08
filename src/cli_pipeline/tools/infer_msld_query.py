@@ -99,7 +99,7 @@ def _build_test_records(prompts_file: str, labels_csv: str, split: str) -> List[
 
 def run(args) -> None:
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    if ckpt.get("version") != "msld_v1":
+    if ckpt.get("version") not in {"msld_v1", "msld_v2_consistency_refine"}:
         raise RuntimeError("Unsupported checkpoint version")
 
     model, tokenizer = _build_model_and_tokenizer(args)
@@ -113,9 +113,18 @@ def run(args) -> None:
         module_emb_dim=int(cfg_raw["module_emb_dim"]),
         label_hidden_dim=int(cfg_raw["label_hidden_dim"]),
         dropout=float(cfg_raw["dropout"]),
+        refine_hidden_dim=int(cfg_raw.get("refine_hidden_dim", 64)),
+        type_emb_dim=int(cfg_raw.get("type_emb_dim", 16)),
+        max_cell_types=int(cfg_raw.get("max_cell_types", 256)),
+        max_drug_types=int(cfg_raw.get("max_drug_types", 8192)),
     )
     heads = MSLDHeads(cfg).to(head_device)
-    heads.load_state_dict(ckpt["heads_state_dict"])
+    load_info = heads.load_state_dict(ckpt["heads_state_dict"], strict=False)
+    if load_info.missing_keys or load_info.unexpected_keys:
+        print(
+            f"[MSLD] load_state_dict non-strict: "
+            f"missing={len(load_info.missing_keys)} unexpected={len(load_info.unexpected_keys)}"
+        )
     heads.eval()
 
     label_candidates = (
@@ -171,6 +180,7 @@ def run(args) -> None:
             pred = heads.predict_margin(h_t, mech_logits, bm_t)
             margin = pred["margin"].squeeze(0)
             z_hat = pred["z_hat"].squeeze(0)
+            expected_deg_prob = pred["expected_deg_prob"].squeeze(0)
             a = compute_sufficiency_score(
                 mechanism_probs=z_hat.unsqueeze(0),
                 margin=margin.unsqueeze(0),
@@ -181,6 +191,7 @@ def run(args) -> None:
 
         margin_f = float(margin.detach().cpu())
         a_f = float(a.detach().cpu())
+        expected_deg_f = float(expected_deg_prob.detach().cpu())
         if a_f < tau:
             final_label = "insufficient"
         else:
@@ -207,6 +218,7 @@ def run(args) -> None:
                 "base_scores": base_map,
                 "base_margin": base_margin,
                 "pred_margin": margin_f,
+                "expected_deg_prob": expected_deg_f,
                 "sufficiency": a_f,
                 "tau": tau,
                 "mechanism_entropy": ent,
