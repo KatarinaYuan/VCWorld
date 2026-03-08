@@ -2,7 +2,7 @@
 #SBATCH --job-name=vcworld-de-msld-infer-k0_m50
 #SBATCH --partition=TrixieMain
 #SBATCH --account=ai4d-core-132
-#SBATCH --exclude=trixie-cn109,trixie-cn130
+#SBATCH --exclude=trixie-cn109,trixie-cn131
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
