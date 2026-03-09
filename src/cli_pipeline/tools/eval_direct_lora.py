@@ -74,14 +74,17 @@ def _score_split(
     max_input_tokens: int,
     label_candidates: List[str],
     label_prefix: str,
+    log_every_examples: int,
 ) -> Dict[str, List]:
     prefix_ids = tokenizer(label_prefix, add_special_tokens=False).input_ids
     candidate_ids = build_label_candidate_id_lists(tokenizer, label_candidates)
     y_true: List[int] = []
     score_maps: List[Dict[str, float]] = []
     meta: List[Dict[str, str]] = []
+    total_examples = len(examples)
+    log_every = max(1, int(log_every_examples))
     with torch.no_grad():
-        for ex in examples:
+        for i, ex in enumerate(examples, 1):
             if ex.label is None:
                 continue
             prompt_ids = build_query_prompt_ids(
@@ -107,6 +110,8 @@ def _score_split(
                     "split": ex.split,
                 }
             )
+            if (i % log_every == 0) or (i == total_examples):
+                print(f"[Direct-LoRA-eval] scored {i}/{total_examples} examples", flush=True)
     return {"y_true": y_true, "score_maps": score_maps, "meta": meta}
 
 
@@ -141,6 +146,7 @@ def run(args) -> None:
         max_input_tokens=args.max_input_tokens,
         label_candidates=label_candidates,
         label_prefix=args.label_prefix,
+        log_every_examples=args.log_every_examples,
     )
     y_true: List[int] = scored["y_true"]
     score_maps: List[Dict[str, float]] = scored["score_maps"]
@@ -238,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--default-cell-id", type=int, default=0)
 
     p.add_argument("--max-input-tokens", type=int, default=2048)
+    p.add_argument("--log-every-examples", type=int, default=50)
     p.add_argument("--label-candidates", default="yes,no,insufficient")
     p.add_argument("--label-prefix", default="\nFinal Deterministic Prediction:\n")
 
