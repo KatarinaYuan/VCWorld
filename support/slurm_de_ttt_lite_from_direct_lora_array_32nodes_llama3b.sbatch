@@ -33,7 +33,7 @@ inner_lr="${INNER_LR:-5e-5}"
 inner_max_tokens="${INNER_MAX_TOKENS:-5120}"
 tag=$(printf "%03d" "${SLURM_ARRAY_TASK_ID}")
 
-SHARD_ROOT="/projects/AI4D/core-132/PerturbReason_data/C32_${flag}_DE_shards_32"
+SHARD_ROOT="/projects/AI4D/core-132/PerturbReason_data/C32_${flag}_DE_direct_lora_shards_32"
 PROMPTS_SHARD="${SHARD_ROOT}/prompts_${tag}.txt"
 TRUTH_CSV="/projects/AI4D/core-132/PerturbReason_data/C32_${flag}_DE.csv"
 INIT_ADAPTER="/projects/AI4D/core-132/PerturbReason_data/C32_${flag}_DE_llama3b_direct_lora_predictions/best_adapter"
