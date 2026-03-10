@@ -70,13 +70,13 @@ def _extract_pred_label(task: str, query_text: str) -> str:
     if task == "de":
         # Explicit "no" patterns first to avoid false positive from generic "impact".
         if (
-            re.search(r"^\s*[\*\-\s]*no[\.\:\s]", focus, re.MULTILINE)
+            re.search(r"^\s*[\*\-\s]*no(?:[\.\:\s]|$)", focus, re.MULTILINE)
             or re.search(r"\bdoes\s+not\s+(impact|affect|result\s+in\s+differential\s+expression)\b", focus)
             or re.search(r"\b(no|without)\s+(impact|effect)\b", focus)
         ):
             return "no"
         if (
-            re.search(r"^\s*[\*\-\s]*yes[\.\:\s]", focus, re.MULTILINE)
+            re.search(r"^\s*[\*\-\s]*yes(?:[\.\:\s]|$)", focus, re.MULTILINE)
             or re.search(r"\bresults?\s+in\s+differential\s+expression\b", focus)
             or re.search(r"\b(predict|prediction).*?\b(differential\s+expression|impact|affect)\b", focus)
             or re.search(r"\bperturbation\b.*\b(impacts?|affects?)\b", focus)
@@ -88,14 +88,14 @@ def _extract_pred_label(task: str, query_text: str) -> str:
 
     # dir
     if (
-        re.search(r"^\s*[\*\-\s]*decrease[\.\:\s]", focus, re.MULTILINE)
+        re.search(r"^\s*[\*\-\s]*decrease(?:[\.\:\s]|$)", focus, re.MULTILINE)
         or re.search(r"\bresults?\s+in\s+(a\s+)?decrease\b", focus)
         or re.search(r"\bpredict.*\bdecrease\b", focus)
         or re.search(r"\bdecreases?\s+expression\b", focus)
     ):
         return "decrease"
     if (
-        re.search(r"^\s*[\*\-\s]*increase[\.\:\s]", focus, re.MULTILINE)
+        re.search(r"^\s*[\*\-\s]*increase(?:[\.\:\s]|$)", focus, re.MULTILINE)
         or re.search(r"\bresults?\s+in\s+(an?\s+)?increase\b", focus)
         or re.search(r"\bpredict.*\bincrease\b", focus)
         or re.search(r"\bincreases?\s+expression\b", focus)

@@ -87,6 +87,11 @@ def _add_prompt_args(p: argparse.ArgumentParser) -> None:
                    help="Inject gold label into [Start of Output] block (for training prompts).")
     p.add_argument("--labels-csv", default=None,
                    help="Optional CSV with pert/gene/label for fallback label lookup in prompt stage.")
+    p.add_argument(
+        "--gene-alias-json",
+        default=None,
+        help="Optional gene alias mapping JSON for gene-description fallback (e.g., ENSG/alias -> canonical symbol).",
+    )
     p.add_argument("--max-observation-examples", type=int, default=10,
                    help="Max retrieved observation examples inserted into prompt input (0 disables examples).")
     p.add_argument("--disable-observation-results", action="store_true",
@@ -250,6 +255,7 @@ def main(argv: list[str]) -> int:
             seed=args.seed,
             include_gold_label=args.include_gold_label,
             labels_csv=args.labels_csv,
+            gene_alias_json=args.gene_alias_json,
             max_observation_examples=args.max_observation_examples,
             disable_observation_results=args.disable_observation_results,
         )
