@@ -67,6 +67,25 @@ def _build_graph_gene_features_torch(
     return torch.stack(feats, dim=-1)
 
 
+def _posterior_from_logits(
+    *,
+    module_logits: torch.Tensor,
+    temperature: float,
+    topk: int,
+) -> torch.Tensor:
+    logits = module_logits.reshape(-1)
+    temp = float(max(1e-4, temperature))
+    logits = logits / temp
+    m = int(logits.numel())
+    k = int(topk)
+    if k > 0 and k < m:
+        top_idx = torch.topk(logits, k=k).indices
+        masked = torch.full_like(logits, fill_value=-1e9)
+        masked[top_idx] = logits[top_idx]
+        logits = masked
+    return torch.softmax(logits, dim=-1)
+
+
 def run(args) -> None:
     _set_seed(args.seed)
     graph = load_graph_for_baseline(
@@ -143,6 +162,10 @@ def run(args) -> None:
         f"[GraphLLM-Train] device={device} modules={graph.num_modules} "
         f"train_examples={len(train_examples)} perturbations={len(perturbations)} hidden_dim={hidden_dim}"
     )
+    print(
+        f"[GraphLLM-Train] posterior_temperature={args.posterior_temperature:.4f} "
+        f"posterior_topk={int(args.posterior_topk)} lambda_sp={args.lambda_sp:.4f}"
+    )
 
     # Build quick lookup: perturbation -> (gene_id -> (label, hidden))
     by_pert: Dict[str, Dict[int, Dict[str, object]]] = {}
@@ -203,7 +226,12 @@ def run(args) -> None:
                 proposer_feature_set=args.proposer_feature_set,
             )
             mod_feat_t = _to_torch(mod_feat_np, device=device)
-            q_t = model.infer_module_posterior(mod_feat_t)["q"]
+            mod_out = model.infer_module_posterior(mod_feat_t)
+            q_t = _posterior_from_logits(
+                module_logits=mod_out["module_logits"],
+                temperature=args.posterior_temperature,
+                topk=args.posterior_topk,
+            )
 
             graph_feat_t = _build_graph_gene_features_torch(
                 graph=graph,
@@ -284,6 +312,8 @@ def run(args) -> None:
             "gene_feature_set": args.gene_feature_set,
             "include_top_module_coverage": bool(include_top_cov),
             "gene_top_k_modules": int(args.gene_top_k_modules),
+            "posterior_temperature": float(args.posterior_temperature),
+            "posterior_topk": int(args.posterior_topk),
         },
         "loss_config": {
             "lambda_prior": float(args.lambda_prior),
@@ -368,6 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-prior", type=float, default=0.1)
     p.add_argument("--lambda-sp", type=float, default=0.01)
     p.add_argument("--pos-weight", type=float, default=1.0)
+    p.add_argument("--posterior-temperature", type=float, default=1.0)
+    p.add_argument("--posterior-topk", type=int, default=0, help="0 means full softmax; >0 keeps only top-k modules.")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--bf16", action="store_true")

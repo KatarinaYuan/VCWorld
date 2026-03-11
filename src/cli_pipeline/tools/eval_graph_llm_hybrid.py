@@ -65,6 +65,25 @@ def _build_graph_gene_features_torch(
     return torch.stack(feats, dim=-1)
 
 
+def _posterior_from_logits(
+    *,
+    module_logits: torch.Tensor,
+    temperature: float,
+    topk: int,
+) -> torch.Tensor:
+    logits = module_logits.reshape(-1)
+    temp = float(max(1e-4, temperature))
+    logits = logits / temp
+    m = int(logits.numel())
+    k = int(topk)
+    if k > 0 and k < m:
+        top_idx = torch.topk(logits, k=k).indices
+        masked = torch.full_like(logits, fill_value=-1e9)
+        masked[top_idx] = logits[top_idx]
+        logits = masked
+    return torch.softmax(logits, dim=-1)
+
+
 def run(args) -> None:
     ckpt = torch.load(args.ckpt, map_location="cpu")
     if ckpt.get("version") != "graph_llm_hybrid_v1":
@@ -134,6 +153,8 @@ def run(args) -> None:
     min_query_size = int(_resolve_config(args, ckpt, "min_query_size"))
     include_top_cov = bool(model_cfg.get("include_top_module_coverage", True))
     top_k_modules = int(model_cfg.get("gene_top_k_modules", 8))
+    posterior_temperature = float(_resolve_config(args, ckpt, "posterior_temperature"))
+    posterior_topk = int(_resolve_config(args, ckpt, "posterior_topk"))
     gene_feature_set = str(model_cfg["gene_feature_set"])
     proposer_feature_set = str(model_cfg["proposer_feature_set"])
     seed = int(args.seed if args.seed is not None else ckpt.get("args", {}).get("seed", 42))
@@ -181,7 +202,12 @@ def run(args) -> None:
                 support_labels=s_labels.tolist(),
                 proposer_feature_set=proposer_feature_set,
             )
-            q_t = model.infer_module_posterior(_to_torch(mod_feat_np, device=device))["q"]
+            mod_out = model.infer_module_posterior(_to_torch(mod_feat_np, device=device))
+            q_t = _posterior_from_logits(
+                module_logits=mod_out["module_logits"],
+                temperature=posterior_temperature,
+                topk=posterior_topk,
+            )
             q_np = q_t.detach().cpu().numpy().astype(np.float32)
 
             graph_feat_t = _build_graph_gene_features_torch(
@@ -316,6 +342,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-name", default=None)
     p.add_argument("--max-input-tokens", type=int, default=None)
     p.add_argument("--hidden-cache", default=None)
+    p.add_argument("--posterior-temperature", type=float, default=None)
+    p.add_argument("--posterior-topk", type=int, default=None)
     p.add_argument("--support-fraction", type=float, default=None)
     p.add_argument("--min-support-size", type=int, default=None)
     p.add_argument("--min-query-size", type=int, default=None)
@@ -338,4 +366,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
