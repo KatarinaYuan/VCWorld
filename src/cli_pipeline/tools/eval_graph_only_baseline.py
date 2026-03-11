@@ -32,6 +32,7 @@ from graph_only_baseline_utils import (
 
 
 def _resolve_config(args, ckpt: dict, key: str):
+    defaults = {"episode_mode": "full_perturbation"}
     value = getattr(args, key)
     if value is not None:
         return value
@@ -41,6 +42,8 @@ def _resolve_config(args, ckpt: dict, key: str):
         return ckpt["episode_config"][key]
     if key in ckpt.get("args", {}):
         return ckpt["args"][key]
+    if key in defaults:
+        return defaults[key]
     raise KeyError(f"Cannot resolve config for key={key}")
 
 
@@ -117,6 +120,7 @@ def run(args) -> None:
     if not perturbations:
         raise RuntimeError("No perturbations survive min-gene filtering on eval split.")
 
+    episode_mode = str(_resolve_config(args, ckpt, "episode_mode"))
     support_fraction = float(_resolve_config(args, ckpt, "support_fraction"))
     min_support_size = int(_resolve_config(args, ckpt, "min_support_size"))
     min_query_size = int(_resolve_config(args, ckpt, "min_query_size"))
@@ -138,18 +142,26 @@ def run(args) -> None:
 
     with torch.no_grad():
         for i, pert in enumerate(perturbations, 1):
-            episode = sample_episode_for_perturbation(
-                pert,
-                seed=seed,
-                epoch=0,
-                support_fraction=support_fraction,
-                min_support_size=min_support_size,
-                min_query_size=min_query_size,
-                max_support_size=max_support_size,
-            )
-            if episode is None:
-                skipped_perturbations += 1
-                continue
+            if episode_mode == "full_perturbation":
+                episode = {
+                    "support_gene_ids": pert.gene_ids.astype(np.int64),
+                    "support_labels": pert.labels.astype(np.float32),
+                    "query_gene_ids": pert.gene_ids.astype(np.int64),
+                    "query_labels": pert.labels.astype(np.float32),
+                }
+            else:
+                episode = sample_episode_for_perturbation(
+                    pert,
+                    seed=seed,
+                    epoch=0,
+                    support_fraction=support_fraction,
+                    min_support_size=min_support_size,
+                    min_query_size=min_query_size,
+                    max_support_size=max_support_size,
+                )
+                if episode is None:
+                    skipped_perturbations += 1
+                    continue
 
             mod_feat_np, _, mod_aux = build_module_feature_matrix(
                 graph=graph,
@@ -256,6 +268,7 @@ def run(args) -> None:
         "mean_posterior_entropy": mean_entropy,
         "mean_support_positive_rate": mean_support_pos_rate,
         "episode_config": {
+            "episode_mode": episode_mode,
             "support_fraction": support_fraction,
             "min_support_size": min_support_size,
             "min_query_size": min_query_size,
@@ -333,6 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kg-graph-file", "--kg_graph_file", dest="kg_graph_file", default=None)
 
     p.add_argument("--support-fraction", "--support_fraction", dest="support_fraction", type=float, default=None)
+    p.add_argument(
+        "--episode-mode",
+        "--episode_mode",
+        dest="episode_mode",
+        default=None,
+        choices=["full_perturbation", "intra_perturbation"],
+    )
     p.add_argument("--min-support-size", "--min_support_size", dest="min_support_size", type=int, default=None)
     p.add_argument("--min-query-size", "--min_query_size", dest="min_query_size", type=int, default=None)
     p.add_argument("--max-support-size", "--max_support_size", dest="max_support_size", type=int, default=None)

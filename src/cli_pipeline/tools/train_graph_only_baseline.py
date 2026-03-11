@@ -19,7 +19,6 @@ from graph_only_baseline_model import (
     GraphOnlyPerturbationPredictor,
 )
 from graph_only_baseline_utils import (
-    GraphOnlyPerturbation,
     build_module_feature_matrix,
     build_perturbations,
     distribution_entropy,
@@ -157,7 +156,7 @@ def run(args) -> None:
     print(
         f"[GraphOnly-Train] proposer={args.proposer_arch}/{args.proposer_feature_set} "
         f"gene_scorer={args.gene_scorer_arch}/{args.gene_feature_set} "
-        f"support_fraction={args.support_fraction:.4f}"
+        f"episode_mode={args.episode_mode} support_fraction={args.support_fraction:.4f}"
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -175,18 +174,26 @@ def run(args) -> None:
 
         for step_i, order_idx in enumerate(order.tolist(), 1):
             pert = train_perturbations[int(order_idx)]
-            episode = sample_episode_for_perturbation(
-                pert,
-                seed=args.seed,
-                epoch=epoch,
-                support_fraction=args.support_fraction,
-                min_support_size=args.min_support_size,
-                min_query_size=args.min_query_size,
-                max_support_size=args.max_support_size,
-            )
-            if episode is None:
-                skipped_episodes += 1
-                continue
+            if args.episode_mode == "full_perturbation":
+                episode = {
+                    "support_gene_ids": pert.gene_ids.astype(np.int64),
+                    "support_labels": pert.labels.astype(np.float32),
+                    "query_gene_ids": pert.gene_ids.astype(np.int64),
+                    "query_labels": pert.labels.astype(np.float32),
+                }
+            else:
+                episode = sample_episode_for_perturbation(
+                    pert,
+                    seed=args.seed,
+                    epoch=epoch,
+                    support_fraction=args.support_fraction,
+                    min_support_size=args.min_support_size,
+                    min_query_size=args.min_query_size,
+                    max_support_size=args.max_support_size,
+                )
+                if episode is None:
+                    skipped_episodes += 1
+                    continue
 
             mod_feat_np, _, mod_aux = build_module_feature_matrix(
                 graph=graph,
@@ -300,6 +307,7 @@ def run(args) -> None:
             "lambda_sp": float(args.lambda_sp),
         },
         "episode_config": {
+            "episode_mode": args.episode_mode,
             "support_fraction": float(args.support_fraction),
             "min_support_size": int(args.min_support_size),
             "min_query_size": int(args.min_query_size),
@@ -355,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-modules", type=int, default=2048)
 
     p.add_argument("--min-genes-per-perturbation", type=int, default=8)
+    p.add_argument(
+        "--episode-mode",
+        default="full_perturbation",
+        choices=["full_perturbation", "intra_perturbation"],
+        help="full_perturbation: use all genes as support/query; intra_perturbation: split support/query within pert.",
+    )
     p.add_argument("--support-fraction", type=float, default=0.2)
     p.add_argument("--min-support-size", type=int, default=4)
     p.add_argument("--min-query-size", type=int, default=4)
