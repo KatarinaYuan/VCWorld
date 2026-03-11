@@ -31,12 +31,20 @@ def _to_torch(x: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def _resolve_config(args, ckpt: dict, key: str):
-    value = getattr(args, key)
+    defaults = {
+        "beta_prior_logit": 1.0,
+        "gamma_support_logit": 1.0,
+        "posterior_temperature": 1.0,
+        "posterior_topk": 0,
+    }
+    value = getattr(args, key, None)
     if value is not None:
         return value
     for section in ("model_config", "loss_config", "episode_config", "graph_config", "llm_config", "args"):
         if key in ckpt.get(section, {}):
             return ckpt[section][key]
+    if key in defaults:
+        return defaults[key]
     raise KeyError(f"Cannot resolve config key={key}")
 
 
@@ -363,6 +371,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-cache", default=None)
     p.add_argument("--posterior-temperature", type=float, default=None)
     p.add_argument("--posterior-topk", type=int, default=None)
+    p.add_argument("--beta-prior-logit", type=float, default=None)
+    p.add_argument("--gamma-support-logit", type=float, default=None)
     p.add_argument("--support-fraction", type=float, default=None)
     p.add_argument("--min-support-size", type=int, default=None)
     p.add_argument("--min-query-size", type=int, default=None)
