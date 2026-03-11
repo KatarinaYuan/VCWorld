@@ -20,7 +20,6 @@ from graph_only_baseline_model import (
 )
 from graph_only_baseline_utils import (
     GraphOnlyPerturbation,
-    build_gene_feature_matrix,
     build_module_feature_matrix,
     build_perturbations,
     distribution_entropy,
@@ -42,6 +41,49 @@ def _set_seed(seed: int) -> None:
 
 def _to_torch(x: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32, device=device)
+
+
+def _build_gene_features_torch(
+    *,
+    graph,
+    query_gene_ids: np.ndarray,
+    q_t: torch.Tensor,
+    target_module_distribution: np.ndarray,
+    gene_feature_set: str,
+    include_top_cov: bool,
+    top_k_modules: int,
+    device: torch.device,
+) -> torch.Tensor:
+    gids = np.asarray(query_gene_ids, dtype=np.int64)
+    if gids.size <= 0:
+        return torch.zeros((0, 0), dtype=torch.float32, device=device)
+
+    # Constant graph proximity matrix for query genes: [N, M].
+    prox_np = graph.r_tilde[gids].toarray().astype(np.float32)
+    prox_t = _to_torch(prox_np, device=device)
+
+    feats: List[torch.Tensor] = []
+    mode = gene_feature_set.strip().lower()
+    if mode not in {"alignment_only", "full"}:
+        raise ValueError(f"Unsupported gene_feature_set: {gene_feature_set}")
+
+    # Differentiable path: label loss -> gene scorer -> q_t -> proposer.
+    module_alignment = prox_t @ q_t
+    feats.append(module_alignment)
+
+    if mode == "full":
+        target_dist_t = _to_torch(np.asarray(target_module_distribution, dtype=np.float32), device=device)
+        target_gene_prox = prox_t @ target_dist_t
+        feats.append(target_gene_prox)
+
+        if include_top_cov:
+            with torch.no_grad():
+                k = max(1, min(int(top_k_modules), int(q_t.shape[0])))
+                top_idx = torch.topk(q_t.detach(), k=k).indices
+            top_cov = (prox_t[:, top_idx] > 0.0).float().sum(dim=-1)
+            feats.append(top_cov)
+
+    return torch.stack(feats, dim=-1)
 
 
 def run(args) -> None:
@@ -164,21 +206,21 @@ def run(args) -> None:
             prior_np = mod_aux["module_prior"].astype(np.float32)
             prior_t = _to_torch(prior_np, device=device)
 
-            gene_feat_np, _, _ = build_gene_feature_matrix(
+            gene_feat_t = _build_gene_features_torch(
                 graph=graph,
-                query_gene_ids=episode["query_gene_ids"].tolist(),
-                q_probs=q_t.detach().cpu().numpy(),
+                query_gene_ids=episode["query_gene_ids"],
+                q_t=q_t,
                 target_module_distribution=mod_aux["target_module_distribution"],
                 gene_feature_set=args.gene_feature_set,
-                include_top_module_coverage=include_top_cov,
+                include_top_cov=include_top_cov,
                 top_k_modules=args.gene_top_k_modules,
+                device=device,
             )
-            if gene_feat_np.shape[0] <= 0:
+            if gene_feat_t.shape[0] <= 0:
                 skipped_episodes += 1
                 continue
 
             y_query_t = _to_torch(episode["query_labels"].astype(np.float32), device=device)
-            gene_feat_t = _to_torch(gene_feat_np, device=device)
             gene_logits_t = model.score_genes(gene_feat_t)
 
             l_label = F.binary_cross_entropy_with_logits(gene_logits_t, y_query_t)
@@ -349,4 +391,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
