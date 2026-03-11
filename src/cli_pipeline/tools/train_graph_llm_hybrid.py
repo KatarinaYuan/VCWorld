@@ -70,10 +70,25 @@ def _build_graph_gene_features_torch(
 def _posterior_from_logits(
     *,
     module_logits: torch.Tensor,
+    prior_probs: torch.Tensor,
+    support_contrast: torch.Tensor,
+    beta_prior_logit: float,
+    gamma_support_logit: float,
+    logit_noise_std: float,
+    training: bool,
     temperature: float,
     topk: int,
 ) -> torch.Tensor:
     logits = module_logits.reshape(-1)
+    prior = prior_probs.reshape(-1).clamp_min(1e-8)
+    contrast = support_contrast.reshape(-1)
+    if contrast.numel() > 0:
+        c_mean = contrast.mean()
+        c_std = contrast.std(unbiased=False).clamp_min(1e-6)
+        contrast = (contrast - c_mean) / c_std
+    logits = logits + float(beta_prior_logit) * torch.log(prior) + float(gamma_support_logit) * contrast
+    if training and float(logit_noise_std) > 0.0:
+        logits = logits + float(logit_noise_std) * torch.randn_like(logits)
     temp = float(max(1e-4, temperature))
     logits = logits / temp
     m = int(logits.numel())
@@ -229,8 +244,16 @@ def run(args) -> None:
             )
             mod_feat_t = _to_torch(mod_feat_np, device=device)
             mod_out = model.infer_module_posterior(mod_feat_t)
+            prior_t = _to_torch(mod_aux["module_prior"].astype(np.float32), device=device)
+            contrast_t = _to_torch(mod_aux["contrast_score"].astype(np.float32), device=device)
             q_t = _posterior_from_logits(
                 module_logits=mod_out["module_logits"],
+                prior_probs=prior_t,
+                support_contrast=contrast_t,
+                beta_prior_logit=args.beta_prior_logit,
+                gamma_support_logit=args.gamma_support_logit,
+                logit_noise_std=args.posterior_logit_noise_std,
+                training=True,
                 temperature=args.posterior_temperature,
                 topk=args.posterior_topk,
             )
@@ -256,8 +279,6 @@ def run(args) -> None:
             y_t = _to_torch(q_labels.astype(np.float32), device=device)
 
             logits_t = model.score_genes(graph_feat_t, hidden_t)
-            prior_t = _to_torch(mod_aux["module_prior"].astype(np.float32), device=device)
-
             l_label = F.binary_cross_entropy_with_logits(logits_t, y_t, pos_weight=pos_weight_t)
             l_prior = torch.sum(q_t * (torch.log(q_t.clamp_min(1e-8)) - torch.log(prior_t.clamp_min(1e-8))))
             l_sp = -torch.sum(q_t * torch.log(q_t.clamp_min(1e-8)))
@@ -324,6 +345,9 @@ def run(args) -> None:
             "gene_top_k_modules": int(args.gene_top_k_modules),
             "posterior_temperature": float(args.posterior_temperature),
             "posterior_topk": int(args.posterior_topk),
+            "beta_prior_logit": float(args.beta_prior_logit),
+            "gamma_support_logit": float(args.gamma_support_logit),
+            "posterior_logit_noise_std": float(args.posterior_logit_noise_std),
         },
         "loss_config": {
             "lambda_prior": float(args.lambda_prior),
@@ -424,6 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pos-weight", type=float, default=1.0)
     p.add_argument("--posterior-temperature", type=float, default=1.0)
     p.add_argument("--posterior-topk", type=int, default=0, help="0 means full softmax; >0 keeps only top-k modules.")
+    p.add_argument("--beta-prior-logit", type=float, default=1.0, help="Weight of log(prior) added to posterior logits.")
+    p.add_argument("--gamma-support-logit", type=float, default=1.0, help="Weight of support contrast added to posterior logits.")
+    p.add_argument(
+        "--posterior-logit-noise-std",
+        type=float,
+        default=0.01,
+        help="Training-only Gaussian noise on posterior logits to break tie collapse.",
+    )
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--bf16", action="store_true")

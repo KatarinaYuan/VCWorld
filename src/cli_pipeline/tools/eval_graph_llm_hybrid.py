@@ -68,10 +68,21 @@ def _build_graph_gene_features_torch(
 def _posterior_from_logits(
     *,
     module_logits: torch.Tensor,
+    prior_probs: torch.Tensor,
+    support_contrast: torch.Tensor,
+    beta_prior_logit: float,
+    gamma_support_logit: float,
     temperature: float,
     topk: int,
 ) -> torch.Tensor:
     logits = module_logits.reshape(-1)
+    prior = prior_probs.reshape(-1).clamp_min(1e-8)
+    contrast = support_contrast.reshape(-1)
+    if contrast.numel() > 0:
+        c_mean = contrast.mean()
+        c_std = contrast.std(unbiased=False).clamp_min(1e-6)
+        contrast = (contrast - c_mean) / c_std
+    logits = logits + float(beta_prior_logit) * torch.log(prior) + float(gamma_support_logit) * contrast
     temp = float(max(1e-4, temperature))
     logits = logits / temp
     m = int(logits.numel())
@@ -155,6 +166,8 @@ def run(args) -> None:
     top_k_modules = int(model_cfg.get("gene_top_k_modules", 8))
     posterior_temperature = float(_resolve_config(args, ckpt, "posterior_temperature"))
     posterior_topk = int(_resolve_config(args, ckpt, "posterior_topk"))
+    beta_prior_logit = float(_resolve_config(args, ckpt, "beta_prior_logit"))
+    gamma_support_logit = float(_resolve_config(args, ckpt, "gamma_support_logit"))
     gene_feature_set = str(model_cfg["gene_feature_set"])
     proposer_feature_set = str(model_cfg["proposer_feature_set"])
     seed = int(args.seed if args.seed is not None else ckpt.get("args", {}).get("seed", 42))
@@ -203,8 +216,14 @@ def run(args) -> None:
                 proposer_feature_set=proposer_feature_set,
             )
             mod_out = model.infer_module_posterior(_to_torch(mod_feat_np, device=device))
+            prior_t = _to_torch(mod_aux["module_prior"].astype(np.float32), device=device)
+            contrast_t = _to_torch(mod_aux["contrast_score"].astype(np.float32), device=device)
             q_t = _posterior_from_logits(
                 module_logits=mod_out["module_logits"],
+                prior_probs=prior_t,
+                support_contrast=contrast_t,
+                beta_prior_logit=beta_prior_logit,
+                gamma_support_logit=gamma_support_logit,
                 temperature=posterior_temperature,
                 topk=posterior_topk,
             )
