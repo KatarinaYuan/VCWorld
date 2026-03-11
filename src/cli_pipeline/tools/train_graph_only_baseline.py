@@ -145,6 +145,7 @@ def run(args) -> None:
         device = torch.device("cuda")
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    pos_weight_t = torch.tensor([float(args.pos_weight)], dtype=torch.float32, device=device)
 
     best_state: Dict[str, torch.Tensor] = {}
     best_loss = float("inf")
@@ -156,7 +157,8 @@ def run(args) -> None:
     print(
         f"[GraphOnly-Train] proposer={args.proposer_arch}/{args.proposer_feature_set} "
         f"gene_scorer={args.gene_scorer_arch}/{args.gene_feature_set} "
-        f"episode_mode={args.episode_mode} support_fraction={args.support_fraction:.4f}"
+        f"episode_mode={args.episode_mode} support_fraction={args.support_fraction:.4f} "
+        f"pos_weight={float(args.pos_weight):.4f}"
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -168,6 +170,7 @@ def run(args) -> None:
         total_prior = 0.0
         total_sp = 0.0
         total_acc = 0.0
+        total_yes_rate = 0.0
         total_q_entropy = 0.0
         trained_episodes = 0
         skipped_episodes = 0
@@ -230,7 +233,7 @@ def run(args) -> None:
             y_query_t = _to_torch(episode["query_labels"].astype(np.float32), device=device)
             gene_logits_t = model.score_genes(gene_feat_t)
 
-            l_label = F.binary_cross_entropy_with_logits(gene_logits_t, y_query_t)
+            l_label = F.binary_cross_entropy_with_logits(gene_logits_t, y_query_t, pos_weight=pos_weight_t)
             l_prior = torch.sum(q_t * (torch.log(q_t.clamp_min(1e-8)) - torch.log(prior_t.clamp_min(1e-8))))
             l_sp = -torch.sum(q_t * torch.log(q_t.clamp_min(1e-8)))
             loss = l_label + args.lambda_prior * l_prior + args.lambda_sp * l_sp
@@ -244,6 +247,7 @@ def run(args) -> None:
                 probs = torch.sigmoid(gene_logits_t)
                 pred = (probs >= 0.5).float()
                 acc = float((pred == y_query_t).float().mean().detach().cpu())
+                yes_rate = float(pred.mean().detach().cpu())
                 q_entropy = float(distribution_entropy(q_t.detach().cpu().numpy()))
 
             total_loss += float(loss.detach().cpu())
@@ -251,6 +255,7 @@ def run(args) -> None:
             total_prior += float(l_prior.detach().cpu())
             total_sp += float(l_sp.detach().cpu())
             total_acc += acc
+            total_yes_rate += yes_rate
             total_q_entropy += q_entropy
             trained_episodes += 1
 
@@ -269,11 +274,12 @@ def run(args) -> None:
         mean_prior = total_prior / trained_episodes
         mean_sp = total_sp / trained_episodes
         mean_acc = total_acc / trained_episodes
+        mean_yes_rate = total_yes_rate / trained_episodes
         mean_q_ent = total_q_entropy / trained_episodes
         print(
             f"[GraphOnly-Train][Epoch {epoch}/{args.epochs}] "
             f"loss={mean_loss:.6f} label={mean_label:.6f} prior={mean_prior:.6f} "
-            f"entropy={mean_sp:.6f} query_acc={mean_acc:.6f} q_entropy={mean_q_ent:.6f} "
+            f"entropy={mean_sp:.6f} query_acc={mean_acc:.6f} yes_rate={mean_yes_rate:.6f} q_entropy={mean_q_ent:.6f} "
             f"episodes={trained_episodes} skipped={skipped_episodes}"
         )
 
@@ -305,6 +311,7 @@ def run(args) -> None:
         "loss_config": {
             "lambda_prior": float(args.lambda_prior),
             "lambda_sp": float(args.lambda_sp),
+            "pos_weight": float(args.pos_weight),
         },
         "episode_config": {
             "episode_mode": args.episode_mode,
@@ -391,6 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lambda-prior", type=float, default=0.1)
     p.add_argument("--lambda-sp", type=float, default=0.01)
+    p.add_argument("--pos-weight", type=float, default=1.0, help="BCE positive-class weight (no threshold change).")
     p.add_argument("--log-every-episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
