@@ -164,7 +164,8 @@ def run(args) -> None:
     )
     print(
         f"[GraphLLM-Train] posterior_temperature={args.posterior_temperature:.4f} "
-        f"posterior_topk={int(args.posterior_topk)} lambda_sp={args.lambda_sp:.4f}"
+        f"posterior_topk={int(args.posterior_topk)} lambda_sp={args.lambda_sp:.4f} "
+        f"lambda_entropy_hinge={args.lambda_entropy_hinge:.4f} target_entropy={args.target_entropy:.4f}"
     )
 
     # Build quick lookup: perturbation -> (gene_id -> (label, hidden))
@@ -187,6 +188,7 @@ def run(args) -> None:
         total_label = 0.0
         total_prior = 0.0
         total_sp = 0.0
+        total_sp_hinge = 0.0
         total_acc = 0.0
         total_yes = 0.0
         total_q_ent = 0.0
@@ -259,7 +261,13 @@ def run(args) -> None:
             l_label = F.binary_cross_entropy_with_logits(logits_t, y_t, pos_weight=pos_weight_t)
             l_prior = torch.sum(q_t * (torch.log(q_t.clamp_min(1e-8)) - torch.log(prior_t.clamp_min(1e-8))))
             l_sp = -torch.sum(q_t * torch.log(q_t.clamp_min(1e-8)))
-            loss = l_label + args.lambda_prior * l_prior + args.lambda_sp * l_sp
+            l_sp_hinge = torch.relu(l_sp - float(args.target_entropy))
+            loss = (
+                l_label
+                + args.lambda_prior * l_prior
+                + args.lambda_sp * l_sp
+                + args.lambda_entropy_hinge * l_sp_hinge
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -277,6 +285,7 @@ def run(args) -> None:
             total_label += float(l_label.detach().cpu())
             total_prior += float(l_prior.detach().cpu())
             total_sp += float(l_sp.detach().cpu())
+            total_sp_hinge += float(l_sp_hinge.detach().cpu())
             n_ep += 1
 
         if n_ep <= 0:
@@ -284,7 +293,8 @@ def run(args) -> None:
         mean_loss = total_loss / n_ep
         print(
             f"[GraphLLM-Train][Epoch {epoch}/{args.epochs}] loss={mean_loss:.6f} "
-            f"label={total_label/n_ep:.6f} prior={total_prior/n_ep:.6f} entropy={total_sp/n_ep:.6f} "
+            f"label={total_label/n_ep:.6f} prior={total_prior/n_ep:.6f} "
+            f"entropy={total_sp/n_ep:.6f} entropy_hinge={total_sp_hinge/n_ep:.6f} "
             f"query_acc={total_acc/n_ep:.6f} yes_rate={total_yes/n_ep:.6f} q_entropy={total_q_ent/n_ep:.6f} "
             f"episodes={n_ep} skipped={skipped}"
         )
@@ -318,6 +328,8 @@ def run(args) -> None:
         "loss_config": {
             "lambda_prior": float(args.lambda_prior),
             "lambda_sp": float(args.lambda_sp),
+            "lambda_entropy_hinge": float(args.lambda_entropy_hinge),
+            "target_entropy": float(args.target_entropy),
             "pos_weight": float(args.pos_weight),
         },
         "episode_config": {
@@ -397,6 +409,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lambda-prior", type=float, default=0.1)
     p.add_argument("--lambda-sp", type=float, default=0.01)
+    p.add_argument(
+        "--lambda-entropy-hinge",
+        type=float,
+        default=0.0,
+        help="Extra sparsity term: max(0, H(q)-target_entropy).",
+    )
+    p.add_argument(
+        "--target-entropy",
+        type=float,
+        default=4.0,
+        help="Target entropy used by entropy-hinge regularization.",
+    )
     p.add_argument("--pos-weight", type=float, default=1.0)
     p.add_argument("--posterior-temperature", type=float, default=1.0)
     p.add_argument("--posterior-topk", type=int, default=0, help="0 means full softmax; >0 keeps only top-k modules.")
