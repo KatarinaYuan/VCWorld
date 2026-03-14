@@ -72,10 +72,7 @@ This is the default end-to-end VCWorld pipeline:
 
 `prepare -> retrieve -> prompt -> infer -> evaluate`
 
-
-
-<detail>
-<summary>3.1 Prepare labels/splits</summary>
+### 3.1 Prepare labels/splits
 ```bash
 python cli.py ${TASK} prepare \
   --h5ad "${H5AD}" \
@@ -83,13 +80,14 @@ python cli.py ${TASK} prepare \
   --cell-line "${CELL}" \
   --seed 42
 ```
+
 Supported split modes in `prepare`:
+
 - `random_perturbation` (default)
 - `k_perturbation_fixed_genes` (for fixed-support settings with `--k-support-perturbations` / `--m-genes-per-perturbation`)
-</detail>
 
-<details>
-<summary>3.2 Retrieval for train/test prompts</summary>
+### 3.2 Retrieval for train/test prompts
+
 ```bash
 python cli.py ${TASK} retrieve \
   --data-csv "${LABELS_CSV}" \
@@ -98,6 +96,7 @@ python cli.py ${TASK} retrieve \
   --out "${RETR_TRAIN}" \
   --case-split train \
   --budget 10
+
 python cli.py ${TASK} retrieve \
   --data-csv "${LABELS_CSV}" \
   --drug-sim "${DRUG_SIM}" \
@@ -106,25 +105,22 @@ python cli.py ${TASK} retrieve \
   --case-split test \
   --budget 10
 ```
-</details>
 
-<details>
-<summary>3.3 Prompt generation</summary>
+### 3.3 Prompt generation
+
 ```bash
 python cli.py ${TASK} prompt \
   --retrieval "${RETR_TRAIN}" \
   --drug-desc "${DRUG_DESC}" \
   --gene-desc "${GENE_DESC}" \
   --out "${PROMPTS_TRAIN}"
+
 python cli.py ${TASK} prompt \
   --retrieval "${RETR_TEST}" \
   --drug-desc "${DRUG_DESC}" \
   --gene-desc "${GENE_DESC}" \
   --out "${PROMPTS_TEST}"
 ```
-</detail>
-
-
 
 ### 3.4 Inference (choose one backend)
 
