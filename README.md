@@ -72,6 +72,8 @@ This is the default end-to-end VCWorld pipeline:
 
 `prepare -> retrieve -> prompt -> infer -> evaluate`
 
+
+
 <detail>
 <summary>3.1 Prepare labels/splits</summary>
 ```bash
@@ -121,6 +123,8 @@ python cli.py ${TASK} prompt \
   --out "${PROMPTS_TEST}"
 ```
 </detail>
+
+
 
 ### 3.4 Inference (choose one backend)
 
