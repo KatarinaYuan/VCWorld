@@ -68,6 +68,49 @@ def _append_jsonl(path: str, payload: Dict[str, object]) -> None:
         f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
+def _split_train_for_fallback_val(
+    perturbations: Sequence,
+    *,
+    fraction: float,
+    seed: int,
+) -> Tuple[List[object], List[object]]:
+    items = list(perturbations)
+    if len(items) <= 1:
+        return items, []
+
+    # Leave-out by perturbation type (e.g., drug identity), not by episode/sample count.
+    grouped: Dict[str, List[object]] = {}
+    for p in items:
+        pert_name = str(getattr(p, "pert", "")).strip().lower()
+        if not pert_name:
+            pert_name = str(getattr(p, "perturbation_key", "")).strip().lower()
+        grouped.setdefault(pert_name, []).append(p)
+
+    type_keys = sorted(grouped.keys())
+    n_types = len(type_keys)
+    if n_types <= 1:
+        # Degenerate case: only one perturbation type; cannot split by type.
+        return items, []
+
+    frac = float(np.clip(float(fraction), 0.01, 0.5))
+    n_val_types = max(1, int(round(float(n_types) * frac)))
+    n_val_types = min(n_val_types, n_types - 1)
+
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n_types).tolist()
+    val_type_set = {type_keys[i] for i in perm[:n_val_types]}
+
+    train_out: List[object] = []
+    val_out: List[object] = []
+    for t in type_keys:
+        bucket = grouped[t]
+        if t in val_type_set:
+            val_out.extend(bucket)
+        else:
+            train_out.extend(bucket)
+    return train_out, val_out
+
+
 def _episode_candidates(
     *,
     graph,
@@ -263,7 +306,33 @@ def run(args) -> None:
     if not train_perturbations:
         raise RuntimeError("No train perturbations after filtering.")
     if not val_perturbations:
-        raise RuntimeError("No val perturbations after filtering.")
+        if args.allow_val_fallback_from_train:
+            train_perturbations, val_perturbations = _split_train_for_fallback_val(
+                train_perturbations,
+                fraction=args.val_fallback_fraction,
+                seed=args.seed + 2026,
+            )
+            if not val_perturbations:
+                raise RuntimeError(
+                    "No val perturbations after filtering and fallback split failed. "
+                    f"train_examples={len(train_examples)} val_examples={len(val_examples)} "
+                    f"train_split='{args.train_split}' val_split='{args.val_split}'."
+                )
+            print(
+                "[SubgraphV1][Train][WARN] No val perturbations found for requested val split. "
+                f"Fallback to train-holdout: train_perts={len(train_perturbations)} "
+                f"val_perts={len(val_perturbations)} "
+                f"train_types={len({str(getattr(x, 'pert', '')).strip().lower() for x in train_perturbations})} "
+                f"val_types={len({str(getattr(x, 'pert', '')).strip().lower() for x in val_perturbations})} "
+                f"fraction={float(args.val_fallback_fraction):.3f}"
+            )
+        else:
+            raise RuntimeError(
+                "No val perturbations after filtering. "
+                f"train_examples={len(train_examples)} val_examples={len(val_examples)} "
+                f"train_split='{args.train_split}' val_split='{args.val_split}'. "
+                "Try --val-split test or enable fallback from train."
+            )
 
     proposer = HeuristicPathSeededPCSTProposer(
         graph=graph,
@@ -612,6 +681,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--train-split", default="train")
     p.add_argument("--val-split", default="val")
+    p.add_argument("--allow-val-fallback-from-train", action="store_true")
+    p.add_argument("--val-fallback-fraction", type=float, default=0.2)
     p.add_argument("--default-cell-id", type=int, default=0)
 
     p.add_argument("--graph-loader", default="ggmv", choices=["ggmv", "msld"])
